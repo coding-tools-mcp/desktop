@@ -52,6 +52,24 @@ import type { Translate } from "../i18n";
 import type { RunAction } from "../App";
 import { CallList, Empty, EndpointCard, SectionHead } from "./Common";
 import { ConfirmModal } from "./WorkspaceModal";
+function configWarning(
+  status: Status | undefined,
+  isPublic: boolean,
+  t: Translate,
+) {
+  const state = isPublic ? status?.publicState : status?.localState;
+  if (["online", "ready", "ok"].includes(state ?? "")) return "";
+  if (!isPublic && state && !["offline", "stopped"].includes(state)) {
+    return t(
+      "Local service is not ready. You can copy this configuration, but confirm it is running and healthy before connecting a client.",
+    );
+  }
+  return t(
+    isPublic
+      ? "Public access is not verified. You can copy this configuration, but check the connection before using it."
+      : "Local service is offline. You can copy this configuration, but start the workspace before connecting a client.",
+  );
+}
 export function ConnectionsPage({
   workspace,
   status,
@@ -72,11 +90,14 @@ export function ConnectionsPage({
   t: Translate;
   onEdit: () => void;
   onRemove: () => void;
-  onCopy: (text: string) => Promise<void>;
+  onCopy: (text: string, success?: string) => Promise<void>;
   onSaved: (w: Workspace) => void;
 }) {
   const pageActive = usePageActive();
-  const [config, setConfig] = useState<string | null>(null);
+  const [config, setConfig] = useState<{
+    text: string;
+    isPublic: boolean;
+  } | null>(null);
   const [credentials, setCredentials] = useState<AuthDetails | null>(null);
   const [tunnelName, setTunnelName] = useState(
     workspace.tunnelName ||
@@ -99,13 +120,17 @@ export function ConnectionsPage({
   const [validation, setValidation] = useState("");
   const active = isActive(status);
   const setupBusy = busy || maintenanceBusy;
+  async function copyConfig(text: string, isPublic: boolean) {
+    const warning = configWarning(status, isPublic, t);
+    await onCopy(text, [t("Copied"), warning].filter(Boolean).join(" "));
+  }
   async function showConfig(isPublic: boolean, copyOnly = false) {
     const result = await run(copyOnly ? "copy-config" : "config", () =>
       api.connectionConfig(workspace.id, isPublic),
     );
     if (pageActive.current && result !== undefined) {
-      if (copyOnly) await onCopy(result);
-      else setConfig(result);
+      if (copyOnly) await copyConfig(result, isPublic);
+      else setConfig({ text: result, isPublic });
     }
   }
   async function showCredentials() {
@@ -194,6 +219,11 @@ export function ConnectionsPage({
               {t("View configuration")}
             </Button>
           </Group>
+          {status?.localEndpoint && configWarning(status, false, t) && (
+            <Alert color="yellow" mt="sm">
+              {configWarning(status, false, t)}
+            </Alert>
+          )}
         </div>
         <div className="connection-endpoint">
           <EndpointCard
@@ -237,6 +267,11 @@ export function ConnectionsPage({
               </Button>
             )}
           </Group>
+          {status?.publicEndpoint && configWarning(status, true, t) && (
+            <Alert color="yellow" mt="sm">
+              {configWarning(status, true, t)}
+            </Alert>
+          )}
         </div>
       </div>
       {workspace.access === "quick" && (
@@ -437,12 +472,19 @@ export function ConnectionsPage({
           <Alert color="yellow">
             {t("Configuration may contain credentials. Keep it private.")}
           </Alert>
+          {config && configWarning(status, config.isPublic, t) && (
+            <Alert color="yellow">
+              {configWarning(status, config.isPublic, t)}
+            </Alert>
+          )}
           <Code block className="config-code">
-            {config}
+            {config?.text}
           </Code>
           <Button
             leftSection={<Clipboard size={15} />}
-            onClick={() => config && void onCopy(config)}
+            onClick={() =>
+              config && void copyConfig(config.text, config.isPublic)
+            }
           >
             {t("Copy config")}
           </Button>
@@ -539,7 +581,7 @@ export function ActivityPage({
           )}
           {status.activityMessage && (
             <Text size="xs" mt="xs">
-              {status.activityMessage}
+              {t(status.activityMessage)}
             </Text>
           )}
         </Alert>
@@ -568,7 +610,7 @@ export function ActivityPage({
       </div>
       {error && (
         <Alert color="red" title={t("Could not load activity")}>
-          {error}
+          {t(error)}
         </Alert>
       )}
       <Paper withBorder>
@@ -733,10 +775,10 @@ export function DiagnosticsPage({
                 </div>
                 <div>
                   <Text fw={600} size="sm">
-                    {item.name}
+                    {t(item.name)}
                   </Text>
                   <Text size="sm" c="dimmed" className="break-word">
-                    {item.message}
+                    {t(item.message)}
                   </Text>
                 </div>
                 <Badge
@@ -791,7 +833,7 @@ export function DiagnosticsPage({
         </div>
         {logError && (
           <Alert color="red" m="md">
-            {logError}
+            {t(logError)}
           </Alert>
         )}
         {truncated && (
@@ -825,6 +867,7 @@ export function SettingsPage({
   workspace,
   status,
   onSaved,
+  onContinue,
   t,
 }: {
   settings: Settings;
@@ -842,6 +885,7 @@ export function SettingsPage({
   workspace?: Workspace;
   status?: Status;
   onSaved: (workspace: Workspace) => void;
+  onContinue: () => void;
   t: Translate;
 }) {
   const pageActive = usePageActive();
@@ -864,17 +908,19 @@ export function SettingsPage({
     if (pageActive.current && result) setDraft(result);
   }
   async function install() {
-    if (!/^\d+\.\d+(?:\.\d+)?(?:[a-zA-Z0-9.+-]*)$/.test(version)) {
+    const exactVersion = version.trim();
+    // Match the manager's published-version contract before invoking IPC.
+    if (!/^\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?$/.test(exactVersion)) {
       setValidation(t("Enter an exact version, for example 0.5.0."));
       return;
     }
     setValidation("");
     const result = await run(
       "install",
-      () => api.installCore(version),
+      () => api.installCore(exactVersion),
       t("Core installation completed"),
     );
-    if (pageActive.current && result) setOutput(result);
+    if (pageActive.current && result) setOutput("Core installation completed");
   }
   return (
     <Stack gap="xl">
@@ -988,9 +1034,16 @@ export function SettingsPage({
         <div className="core-install">
           <TextInput
             label={t("Version to install")}
-            placeholder="0.5.0"
+            autoFocus={coreAvailable === false}
+            placeholder={t("For example, 0.5.0")}
+            description={t(
+              "Enter a published version. The example is not filled in automatically.",
+            )}
             value={version}
-            onChange={(event) => setVersion(event.currentTarget.value)}
+            onChange={(event) => {
+              setVersion(event.currentTarget.value);
+              setValidation("");
+            }}
             error={validation}
             disabled={!!maintenanceBusy || !available}
           />
@@ -1012,7 +1065,8 @@ export function SettingsPage({
                 api.rollbackCore,
                 t("Core rollback completed"),
               );
-              if (pageActive.current && result) setOutput(result);
+              if (pageActive.current && result)
+                setOutput("Core rollback completed");
             }}
             loading={maintenanceBusy === "rollback"}
             disabled={
@@ -1033,8 +1087,13 @@ export function SettingsPage({
         </Text>
         {output && (
           <Alert color="blue" mt="md" className="break-word">
-            {output}
+            {t(output)}
           </Alert>
+        )}
+        {(coreAvailable || workspace?.coreCommand.length) && (
+          <Button mt="md" onClick={onContinue} disabled={anyBusy}>
+            {t(workspace ? "Back to workspace" : "Create your first workspace")}
+          </Button>
         )}
         <Divider my="lg" />
         <Group justify="space-between">

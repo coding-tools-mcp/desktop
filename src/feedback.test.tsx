@@ -127,7 +127,7 @@ describe("viewport-anchored operation feedback", () => {
       await openSettings(settings);
       expect(screen.getByLabelText(label)).toHaveAttribute(
         "placeholder",
-        "0.5.0",
+        language === "zh" ? "例如：0.5.0" : "For example, 0.5.0",
       );
       await act(async () =>
         fireEvent.click(screen.getByRole("button", { name: install })),

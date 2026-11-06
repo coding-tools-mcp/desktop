@@ -125,8 +125,10 @@ export async function mockDesktop(page: Page, options: FixtureOptions = {}) {
             ];
             return structuredClone(next);
           }
-          if (command === "install_core")
+          if (command === "install_core") {
+            state.snapshot.coreAvailable = true;
             return `TEST FIXTURE: Core ${String(args?.version)} installed`;
+          }
           if (command === "rollback_core")
             return "TEST FIXTURE: Previous core restored";
           if (command === "retry_tunnel")

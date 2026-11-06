@@ -103,8 +103,8 @@ export default function App() {
   // These dialogs unmount on dismissal. Keep focus-return lifecycle in the
   // persistent parent so Mantine observes both the opening and closing edges.
   useFocusReturn({
-    opened: workspaceModal !== undefined,
-    shouldReturnFocus: !editorSaved.current,
+    opened: workspaceModal !== undefined && page !== "Settings",
+    shouldReturnFocus: !editorSaved.current && page !== "Settings",
   });
   useFocusReturn({
     opened: confirm !== null,
@@ -119,6 +119,9 @@ export default function App() {
   const workspace = snapshot?.workspaces.find((w) => w.id === selected);
   const status = snapshot?.statuses.find((s) => s.workspaceId === selected);
   const active = isActive(status);
+  const missingCore = snapshot?.coreAvailable === false;
+  // A workspace may explicitly select its own official executable.
+  const needsCore = missingCore && !workspace?.coreCommand.length;
   const busy = operations.length > 0;
   const workspaceBusy =
     blockingOperation(operations, { key: "workspace", workspaceId: selected })
@@ -276,7 +279,7 @@ export default function App() {
         }[key];
         reportFailure(
           contextualMessage(
-            action ? `${t(action)}: ${errorText(e)}` : errorText(e),
+            action ? `${t(action)}: ${t(errorText(e))}` : t(errorText(e)),
           ),
         );
       }
@@ -291,7 +294,7 @@ export default function App() {
   // Capture the workspace at invocation, even when its page is subsequently removed.
   const runWorkspace: RunAction = (key, fn, success) =>
     run(key, fn, success, workspace?.id);
-  async function copy(value: string) {
+  async function copy(value: string, success = t("Copied")) {
     const sequence = ++feedbackRequest.current;
     setFeedback(null);
     try {
@@ -300,11 +303,11 @@ export default function App() {
         setFeedback((current) =>
           current?.kind === "error"
             ? current
-            : { kind: "success", message: t("Copied") },
+            : { kind: "success", message: success },
         );
     } catch (e) {
       if (mounted.current && sequence === feedbackRequest.current)
-        reportFailure(`${t("Copy failed")}: ${errorText(e)}`);
+        reportFailure(`${t("Copy failed")}: ${t(errorText(e))}`);
     }
   }
   function navigate(next: Page) {
@@ -313,8 +316,17 @@ export default function App() {
     setFeedback(null);
   }
   function openEditor(workspace: Workspace | null) {
+    if (!workspace && missingCore) {
+      navigate("Settings");
+      return;
+    }
+    if (!workspace) navigate("Dashboard");
+    if (!workspace && workspaceModal === null) return;
     editorSaved.current = false;
     setWorkspaceModal(workspace);
+  }
+  function installCore() {
+    navigate("Settings");
   }
   function openConfirmation(confirmation: Confirmation) {
     confirmationCompleted.current = false;
@@ -441,7 +453,7 @@ export default function App() {
           <button
             className="add-workspace"
             onClick={() => openEditor(null)}
-            disabled={!!busy}
+            disabled={busy || (available && !snapshot)}
           >
             <Plus size={15} />
             {t("New workspace")}
@@ -564,7 +576,7 @@ export default function App() {
               )}
               role="alert"
             >
-              {loadError}
+              {t(loadError)}
               <Button
                 ml="sm"
                 size="xs"
@@ -594,6 +606,19 @@ export default function App() {
               {snapshot.migrationNotice}
             </Alert>
           )}
+          {needsCore && !active && page !== "Settings" && (
+            <Alert
+              mb="lg"
+              color="orange"
+              icon={<CircleAlert size={18} />}
+              title={t("Core installation required")}
+            >
+              {t("Install Core before creating and starting a workspace.")}
+              <Button ml="sm" size="xs" onClick={installCore}>
+                {t("Install core")}
+              </Button>
+            </Alert>
+          )}
           {loading ? (
             <div className="loading-screen">
               <Loader color="teal" />
@@ -618,6 +643,9 @@ export default function App() {
               workspace={workspace}
               status={status}
               onSaved={workspaceSaved}
+              onContinue={() =>
+                workspace ? navigate("Dashboard") : openEditor(null)
+              }
               t={t}
             />
           ) : !workspace ? (
@@ -638,9 +666,16 @@ export default function App() {
                   size="md"
                   leftSection={<Plus size={18} />}
                   rightSection={<ArrowRight size={17} />}
-                  onClick={() => openEditor(null)}
+                  disabled={busy || (available && !snapshot)}
+                  onClick={() =>
+                    missingCore ? installCore() : openEditor(null)
+                  }
                 >
-                  {t("Create your first workspace")}
+                  {t(
+                    missingCore
+                      ? "Install core"
+                      : "Create your first workspace",
+                  )}
                 </Button>
               </div>
               <div className="welcome-steps">
@@ -726,12 +761,14 @@ export default function App() {
                           !!status?.portReleasePending
                         }
                         onClick={() =>
-                          void runWorkspace("restart", () =>
-                            api.restart(workspace.id),
-                          )
+                          needsCore
+                            ? installCore()
+                            : void runWorkspace("restart", () =>
+                                api.restart(workspace.id),
+                              )
                         }
                       >
-                        {t("Restart")}
+                        {t(needsCore ? "Install core" : "Restart")}
                       </Button>
                       <Button
                         color="red"
@@ -753,6 +790,14 @@ export default function App() {
                         {t("Stop workspace")}
                       </Button>
                     </>
+                  ) : needsCore ? (
+                    <Button
+                      leftSection={<Terminal size={16} />}
+                      disabled={!!maintenanceBusy || !available}
+                      onClick={installCore}
+                    >
+                      {t("Install core")}
+                    </Button>
                   ) : (
                     <Button
                       leftSection={<Play size={16} />}
@@ -1035,6 +1080,7 @@ export default function App() {
       )}
       {workspaceModal !== undefined && (
         <WorkspaceModal
+          opened={page !== "Settings"}
           workspace={workspaceModal}
           locked={
             !!workspaceModal &&
@@ -1046,6 +1092,8 @@ export default function App() {
           }
           onClose={closeEditor}
           onSaved={saved}
+          coreAvailable={!missingCore}
+          onInstallCore={installCore}
           t={t}
         />
       )}{" "}

@@ -1,5 +1,93 @@
 export type Language = "en" | "zh";
 const zh: Record<string, string> = {
+  "Install core": "安装核心",
+  "Core installation required": "需要安装核心",
+  "Install Core before creating and starting a workspace.":
+    "请先安装核心，再创建并启动工作区。",
+  "Back to workspace": "返回工作区",
+  "For example, 0.5.0": "例如：0.5.0",
+  "Enter a published version. The example is not filled in automatically.":
+    "请输入已发布的版本号，示例不会自动填入。",
+  "Local service is offline. You can copy this configuration, but start the workspace before connecting a client.":
+    "本地服务处于离线状态。可以复制配置，但连接客户端前请先启动工作区。",
+  "Local service is not ready. You can copy this configuration, but confirm it is running and healthy before connecting a client.":
+    "本地服务尚未就绪。可以复制配置，但连接客户端前请确认工作区已启动且服务正常。",
+  "Core readiness check timed out": "核心就绪检查超时",
+  "Recent runtime output:": "最近的运行输出：",
+  "Public access is not verified. You can copy this configuration, but check the connection before using it.":
+    "公网连接尚未验证。可以复制配置，但使用前请先检查连接。",
+  "Python core was not found in PATH or standard user/Homebrew locations. Open Settings and install the pinned core, or select an existing coding-tools-mcp executable.":
+    "未在 PATH 或标准用户目录、Homebrew 目录中找到核心。请在设置中安装指定版本的核心，或选择现有的 coding-tools-mcp 可执行文件。",
+  "The selected managed core is missing or not executable. Reinstall it or roll back before starting; no other installation was selected.":
+    "所选核心不存在或无法执行。启动前请重新安装或回滚；应用未选择其他安装。",
+  "uv was not found in PATH or standard user/Homebrew locations. Install uv from https://docs.astral.sh/uv/getting-started/installation/ before installing a managed core":
+    "未找到 uv。安装受管理的核心前，请按照 https://docs.astral.sh/uv/getting-started/installation/ 安装 uv。",
+  "Enter an exact published version such as 0.5.0":
+    "请输入准确的已发布版本号，例如 0.5.0。",
+  "Installation failed; previous core remains selected. See core-install.log.":
+    "安装失败，仍保留之前选择的核心。请检查网络连接，并查看 core-install.log。",
+  "Installation timed out; previous core remains selected. See core-install.log.":
+    "安装超时，仍保留之前选择的核心。请检查网络连接，并查看 core-install.log。",
+  "New core failed verification; previous core remains selected":
+    "新核心验证失败，仍保留之前选择的核心。",
+  "No previous managed core is available": "没有可供回滚的受管理核心。",
+  "Core installation is already in progress": "核心正在安装，请等待安装完成。",
+  "Core installation is in progress": "核心正在安装，请等待安装完成。",
+  "Choose an existing workspace folder": "请选择现有的工作区文件夹。",
+  "Workspace must be a folder": "工作区路径必须指向文件夹。",
+  "Enter a workspace name of 1 to 120 characters":
+    "请输入 1 到 120 个字符的工作区名称。",
+  "Workspace folder no longer exists": "工作区文件夹已不存在，请重新选择。",
+  "Workspace no longer exists": "工作区已不存在。",
+  "Workspace port is not configured; save the workspace to allocate it":
+    "尚未配置工作区端口，请保存工作区以分配端口。",
+  "Bearer credential is missing; save the workspace to generate one":
+    "缺少 Bearer 凭据，请保存工作区以生成凭据。",
+  "OAuth credentials are missing; repair the workspace configuration":
+    "缺少 OAuth 凭据，请修复工作区配置。",
+  "Workspace operation is in progress": "工作区正在进行其他操作，请稍后重试。",
+  "Workspace operation is already in progress":
+    "工作区正在进行其他操作，请稍后重试。",
+  "Stop the workspace before removing it, including after a crash":
+    "请先停止工作区再移除；即使发生崩溃也需要先停止。",
+  "Executable arguments contain invalid characters":
+    "可执行文件参数包含无效字符。",
+  "Custom core executable is empty": "自定义核心可执行文件不能为空。",
+  "Start local MCP before retrying public access":
+    "重试公网访问前，请先启动本地 MCP 服务。",
+  "Choose safe or trusted permissions before starting this workspace":
+    "启动工作区前，请选择安全模式或信任模式。",
+  "Public access requires bearer-token or OAuth authentication. Repair this workspace before starting it.":
+    "公网访问需要 Bearer 令牌或 OAuth 身份验证，请修复工作区配置后再启动。",
+  "OAuth needs a fixed public address. Choose a named tunnel or bearer authentication for a temporary tunnel.":
+    "OAuth 需要固定公网地址。请选择命名隧道，或为临时隧道使用 Bearer 身份验证。",
+  "Another workspace already uses this port; choose a different port":
+    "其他工作区已占用此端口，请选择其他端口。",
+  "Port is already in use or availability could not be confirmed. Stop its owner or choose another port; no unrelated process was terminated.":
+    "端口已被占用或无法确认可用。请停止占用端口的程序或选择其他端口；应用未终止无关进程。",
+  "Python core exited during startup. Open runtime logs for details.":
+    "核心在启动时退出，请查看运行日志了解详情。",
+  "Core executable is not configured": "尚未配置核心可执行文件。",
+  "Core version probe timed out": "检测核心版本超时，请检查所选可执行文件。",
+  "Core version probe failed": "检测核心版本失败，请检查所选可执行文件。",
+  "Executable did not identify itself as coding-tools-mcp":
+    "所选可执行文件未被识别为 coding-tools-mcp。",
+  "No active public endpoint": "当前没有可用的公网端点。",
+  "Desktop backend unavailable. Open the installed desktop app to manage workspaces.":
+    "桌面后端不可用，请打开已安装的桌面应用来管理工作区。",
+  "Not connected": "未连接",
+  "Local access only": "仅允许本地访问",
+  "Starting the external Python core": "正在启动外部核心",
+  "Stopping owned processes and verifying port release":
+    "正在停止受管理的进程并确认端口释放",
+  "Start the core to check tool-call history support":
+    "启动核心以检查是否支持工具调用历史",
+  "Core startup did not finish; inspect runtime logs and retry":
+    "核心未完成启动，请查看运行日志后重试。",
+  "Local MCP did not start; public access is unavailable":
+    "本地 MCP 服务未启动，公网访问不可用。",
+  "This core build does not expose a tool-call journal. Published 0.5.0 supports launch and connection; history requires an event-capable official core executable.":
+    "此核心版本不提供工具调用日志。已发布的 0.5.0 支持启动和连接；历史记录需要支持事件日志的官方核心可执行文件。",
   "Port is still unavailable": "端口仍不可用",
   "Owned processes have stopped, but the port is not available. Retry Stop to check again, or edit this workspace to choose another port. No unrelated process will be stopped.":
     "受管理的进程已停止，但端口仍不可用。可重试停止以再次检查，或编辑工作区选择其他端口。不会停止无关进程。",
@@ -300,6 +388,21 @@ const zh: Record<string, string> = {
   "Created successfully. Start failed; your workspace is saved and can be retried.":
     "已创建并保存，但启动失败。你可以重试启动。",
 };
-export const translator = (language: Language) => (text: string) =>
-  language === "zh" ? (zh[text] ?? text) : text;
+export const translator = (language: Language) => (text: string) => {
+  if (language !== "zh") return text;
+  if (zh[text]) return zh[text];
+  // Backend failures can append OS details and log output to a known summary.
+  // Translate the application text while retaining diagnostic details verbatim.
+  return text
+    .split("\n")
+    .map((line) => {
+      if (zh[line]) return zh[line];
+      const separator = line.indexOf(": ");
+      const summary = line.slice(0, separator);
+      return separator >= 0 && zh[summary]
+        ? `${zh[summary]} ${line.slice(separator + 2)}`
+        : line;
+    })
+    .join("\n");
+};
 export type Translate = ReturnType<typeof translator>;

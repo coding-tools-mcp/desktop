@@ -51,12 +51,18 @@ export function WorkspaceModal({
   onClose,
   onSaved,
   t,
+  coreAvailable,
+  onInstallCore,
+  opened = true,
   locked = false,
 }: {
   workspace: Workspace | null;
   onClose: () => void;
   onSaved: (workspace: Workspace) => void;
   t: Translate;
+  coreAvailable: boolean;
+  onInstallCore: () => void;
+  opened?: boolean;
   locked?: boolean;
 }) {
   const pageActive = usePageActive();
@@ -69,6 +75,7 @@ export function WorkspaceModal({
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
   const edit = !!workspace;
+  const needsCore = !coreAvailable && draft.coreCommand.length === 0;
   const update = (patch: Partial<Workspace>) =>
     setDraft((d) => ({ ...d, ...patch }));
   async function browse() {
@@ -85,7 +92,7 @@ export function WorkspaceModal({
           name: d.name || path.split(/[\\/]/).filter(Boolean).at(-1) || "",
         }));
     } catch (e) {
-      if (pageActive.current) setError(errorText(e));
+      if (pageActive.current) setError(t(errorText(e)));
     } finally {
       lock.current = false;
       if (pageActive.current) setBusy(false);
@@ -93,6 +100,7 @@ export function WorkspaceModal({
   }
   async function save(start: boolean) {
     if (!pageActive.current || lock.current || locked) return;
+    if (!edit && needsCore) return;
     const invalid = validate(draft, t);
     if (invalid) {
       setError(invalid);
@@ -115,7 +123,7 @@ export function WorkspaceModal({
         } catch (e) {
           if (!pageActive.current) return;
           setError(
-            `${t("Created successfully. Start failed; your workspace is saved and can be retried.")} ${errorText(e)}`,
+            `${t("Created successfully. Start failed; your workspace is saved and can be retried.")} ${t(errorText(e))}`,
           );
           setStep(3);
           return;
@@ -123,7 +131,7 @@ export function WorkspaceModal({
       }
       if (pageActive.current) onClose();
     } catch (e) {
-      if (pageActive.current) setError(errorText(e));
+      if (pageActive.current) setError(t(errorText(e)));
     } finally {
       if (pageActive.current) setBusy(false);
       lock.current = false;
@@ -354,7 +362,7 @@ export function WorkspaceModal({
   );
   return (
     <Modal
-      opened
+      opened={opened}
       onClose={onClose}
       title={t(edit ? "Edit workspace" : "New workspace")}
       size="lg"
@@ -365,6 +373,14 @@ export function WorkspaceModal({
       withCloseButton={!busy}
     >
       <Stack gap="lg">
+        {needsCore && (
+          <Alert color="orange" title={t("Core installation required")}>
+            {t("Install Core before creating and starting a workspace.")}
+            <Button size="xs" ml="sm" onClick={onInstallCore} disabled={busy}>
+              {t("Install core")}
+            </Button>
+          </Alert>
+        )}
         {locked && (
           <Alert color="yellow">
             {t("Stop this workspace before changing its configuration.")}
@@ -495,14 +511,14 @@ export function WorkspaceModal({
               <>
                 <Button
                   variant="default"
-                  disabled={busy || locked || !backendAvailable()}
+                  disabled={busy || locked || needsCore || !backendAvailable()}
                   onClick={() => save(false)}
                 >
                   {t("Create workspace")}
                 </Button>
                 <Button
                   loading={busy}
-                  disabled={locked || !backendAvailable()}
+                  disabled={locked || needsCore || !backendAvailable()}
                   onClick={() => save(true)}
                 >
                   {t("Create and start")}

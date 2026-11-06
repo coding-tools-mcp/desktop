@@ -825,6 +825,8 @@ describe("saved drafts and accessible history", () => {
       <MantineProvider env="test">
         <WorkspaceModal
           workspace={null}
+          coreAvailable
+          onInstallCore={vi.fn()}
           onSaved={onSaved}
           onClose={onClose}
           t={translator("en")}

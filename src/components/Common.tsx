@@ -271,7 +271,7 @@ export function EndpointCard({
           mt="xs"
           className="break-word"
         >
-          {message}
+          {t(message)}
         </Text>
       )}
       <Group mt="lg">
