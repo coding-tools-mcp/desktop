@@ -321,7 +321,7 @@ pub fn probe(w: &Workspace, secrets: &Secrets, public: bool) -> Result<String> {
             .query_pairs_mut()
             .append_pair(crate::gateway::TOKEN_PARAM, &secrets.bearer_token);
     }
-    let mut request=c.post(endpoint).header("Accept","application/json, text/event-stream").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"coding-tools-mcp-desktop-health","version":"0.2.0"}}}));
+    let mut request=c.post(endpoint).header("Accept","application/json, text/event-stream").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"coding-tools-mcp-desktop-health","version":env!("CARGO_PKG_VERSION")}}}));
     request = match w.auth.as_str() {
         "bearer" => request.bearer_auth(&secrets.bearer_token),
         "basic" => request.basic_auth(&w.basic_username, Some(&secrets.basic_password)),
