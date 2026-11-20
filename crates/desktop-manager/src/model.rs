@@ -7,6 +7,9 @@ fn local() -> String {
 fn noauth() -> String {
     "noauth".into()
 }
+fn basic_username() -> String {
+    crate::gateway::DEFAULT_USERNAME.into()
+}
 fn safe() -> String {
     "safe".into()
 }
@@ -28,6 +31,8 @@ pub struct Workspace {
     pub public_url: String,
     #[serde(default = "noauth")]
     pub auth: String,
+    #[serde(default = "basic_username")]
+    pub basic_username: String,
     #[serde(default = "safe")]
     pub permission_mode: String,
     #[serde(default)]
@@ -47,6 +52,8 @@ pub struct Secrets {
     #[serde(default)]
     pub bearer_token: String,
     #[serde(default)]
+    pub basic_password: String,
+    #[serde(default)]
     pub oauth_password: String,
     #[serde(default)]
     pub oauth_token_secret: String,
@@ -54,16 +61,18 @@ pub struct Secrets {
     pub cloudflare_token: String,
 }
 impl Secrets {
+    pub fn generate() -> String {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
     pub fn initialized() -> Self {
-        let secret = || {
-            format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            )
-        };
+        let secret = Self::generate;
         Self {
             bearer_token: secret(),
+            basic_password: secret(),
             oauth_password: secret(),
             oauth_token_secret: secret(),
             cloudflare_token: String::new(),
@@ -72,6 +81,9 @@ impl Secrets {
     pub fn merge(&mut self, input: Self) {
         if !input.bearer_token.is_empty() {
             self.bearer_token = input.bearer_token;
+        }
+        if !input.basic_password.is_empty() {
+            self.basic_password = input.basic_password;
         }
         if !input.oauth_password.is_empty() {
             self.oauth_password = input.oauth_password;
@@ -83,6 +95,7 @@ impl Secrets {
     pub fn values(&self) -> Vec<&str> {
         [
             &self.bearer_token,
+            &self.basic_password,
             &self.oauth_password,
             &self.oauth_token_secret,
             &self.cloudflare_token,

@@ -26,7 +26,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { api, backendAvailable } from "../api";
-import { blankWorkspace, errorText } from "../types";
+import { blankWorkspace, DEFAULT_BASIC_USERNAME, errorText } from "../types";
 import type { Access, Secrets, Workspace } from "../types";
 import type { Translate } from "../i18n";
 import { usePageActive } from "../hooks/usePageActive";
@@ -44,8 +44,8 @@ function validate(workspace: Workspace, t: Translate) {
       !/^https:\/\/[^/]+/.test(workspace.publicUrl))
   )
     return t("OAuth requires a stable HTTPS URL.");
-  if (workspace.access === "quick" && workspace.auth !== "bearer")
-    return t("Quick Tunnel supports bearer authentication only.");
+  if (workspace.auth === "basic" && workspace.basicUsername.includes(":"))
+    return t("Username cannot contain a colon.");
   return null;
 }
 export function WorkspaceModal({
@@ -353,11 +353,10 @@ export function WorkspaceModal({
       auth:
         mode === "local"
           ? "noauth"
-          : mode === "quick"
+          : draft.auth === "noauth" ||
+              (mode === "quick" && draft.auth === "oauth")
             ? "bearer"
-            : draft.auth === "noauth"
-              ? "bearer"
-              : draft.auth,
+            : draft.auth,
     });
   }
   const folder = (
@@ -450,8 +449,21 @@ export function WorkspaceModal({
             onChange={(v) => v && update({ auth: v as Workspace["auth"] })}
             disabled={busy || locked}
             allowDeselect={false}
+            description={
+              draft.auth === "url-token"
+                ? t(
+                    "For clients that cannot send an Authorization header. The token is part of the address, so keep the whole URL private.",
+                  )
+                : draft.auth === "basic"
+                  ? t(
+                      "For clients that sign in with HTTP Basic authentication.",
+                    )
+                  : undefined
+            }
             data={[
               { value: "bearer", label: t("Bearer token") },
+              { value: "url-token", label: t("Token in URL") },
+              { value: "basic", label: t("Username and password") },
               ...(draft.access === "quick"
                 ? []
                 : [{ value: "oauth", label: t("Browser sign-in (OAuth)") }]),
@@ -472,10 +484,40 @@ export function WorkspaceModal({
           )}
         </>
       )}
-      {draft.auth === "bearer" && (
+      {draft.auth === "basic" && (
+        <>
+          <TextInput
+            label={t("Username")}
+            placeholder={DEFAULT_BASIC_USERNAME}
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            autoComplete="off"
+            value={draft.basicUsername}
+            onChange={(e) => update({ basicUsername: e.currentTarget.value })}
+            disabled={busy || locked}
+          />
+          <SecretInput
+            t={t}
+            label={t("Password")}
+            description={t(
+              edit
+                ? "Leave empty to keep the saved secret"
+                : "Leave empty to generate a secure credential",
+            )}
+            value={secrets.basicPassword ?? ""}
+            onChange={(e) =>
+              setSecrets({ ...secrets, basicPassword: e.currentTarget.value })
+            }
+            disabled={busy || locked}
+            autoComplete="new-password"
+          />
+        </>
+      )}
+      {(draft.auth === "bearer" || draft.auth === "url-token") && (
         <SecretInput
           t={t}
-          label={t("Bearer token")}
+          label={t(draft.auth === "bearer" ? "Bearer token" : "URL token")}
           description={t(
             edit
               ? "Leave empty to keep the saved secret"

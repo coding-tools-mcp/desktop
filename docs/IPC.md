@@ -3,7 +3,7 @@
 All Tauri commands return JSON or reject with a human-readable error string. Rust owns configuration, secrets, processes and diagnostics. Commands execute on blocking worker threads, never on the UI thread. No shell plugin or unrestricted filesystem permissions.
 
 Types (camelCase):
-- Workspace: { id: string, name: string, path: string, port: number, access: 'local'|'quick'|'named'|'frp', publicUrl: string, auth: 'noauth'|'bearer'|'oauth', permissionMode: 'safe'|'trusted', coreCommand: string[], coreVersion: string, tunnelName: string, credentialsFile: string, tokenConfigured: boolean }
+- Workspace: { id: string, name: string, path: string, port: number, access: 'local'|'quick'|'named'|'frp', publicUrl: string, auth: 'noauth'|'bearer'|'url-token'|'basic'|'oauth', basicUsername: string, permissionMode: 'safe'|'trusted', coreCommand: string[], coreVersion: string, tunnelName: string, credentialsFile: string, tokenConfigured: boolean }
 - Settings: { language: 'en'|'zh', closeToTray: boolean }
 - Status: { workspaceId: string, state: 'stopped'|'starting'|'running'|'error'|'stopping', pid: number|null, cleanupPending: boolean, portReleasePending: boolean, localState: string, publicState: string, localMessage: string, publicMessage: string, localEndpoint: string, publicEndpoint: string, cpuPercent: number, memoryBytes: number, uptimeSeconds: number, checkedAt: string, publicCheckedAt: string|null, coreVersion: string, activityState: 'available'|'unavailable'|'unknown', activityMessage: string }
 - Activity: { id: string, tool: string, startedAt: string, finishedAt: string|null, outcome: string, durationMs: number|null, errorCategory: string|null, runtimeId: string }
@@ -13,7 +13,7 @@ Types (camelCase):
 
 Commands:
 - snapshot() -> Snapshot
-- save_workspace({ workspace: Workspace, secrets?: { bearerToken?: string, oauthPassword?: string, cloudflareToken?: string } }) -> Workspace. New ID may be empty; port 0 auto-assigns. Empty secret inputs preserve existing values. Running workspaces cannot be reconfigured.
+- save_workspace({ workspace: Workspace, secrets?: { bearerToken?: string, basicPassword?: string, oauthPassword?: string, cloudflareToken?: string } }) -> Workspace. New ID may be empty; port 0 auto-assigns. `bearerToken` is also the `url-token` value. An empty `basicUsername` becomes `ctc`; a credential the chosen method needs is generated when none is saved. Empty secret inputs preserve existing values. Running workspaces cannot be reconfigured.
 - delete_workspace({ id }) -> null. Requires stopped; frontend asks confirmation. Keeps backup and logs.
 - start_workspace({ id }) / stop_workspace({ id }) / restart_workspace({ id }) / retry_tunnel({ id }) -> Status
 - activity({ id }) -> Activity[] (latest 200 calls, newest first)
@@ -21,7 +21,7 @@ Commands:
 - diagnose({ id }) -> Diagnostic[]
 - check_public_route({ id }) -> string (public discovery only; does not run a local executable or send stored credentials)
 - export_diagnostics({ id }) -> string (redacted JSON text; UI can download it with a Blob)
-- connection_config({ id, public: boolean }) -> string (JSON configuration; explicit copy/show action only, may contain bearer token)
+- connection_config({ id, public: boolean }) -> string (JSON configuration; explicit copy/show action only, may contain the bearer token, the `?token=` URL or the Basic header)
 - save_settings({ settings: Settings }) -> Settings
 - pick_directory() / pick_core_executable() -> string|null (native dialogs)
 - validate_workspace_path({ path }) -> string (canonical existing absolute non-root directory)
@@ -33,9 +33,9 @@ Commands:
 - setup_named_tunnel({ id, name: string, hostname: string }) -> Workspace (explicit UI action requiring confirmation that it creates tunnel+DNS; saves reusable local credentials)
 - quit_app() -> null (stops managed services then exits; UI should warn if any services running)
 
-Defaults: first workspace local, safe, noauth, port 0, no custom core command. Remote access requires bearer or OAuth. Quick Tunnel is temporary and suitable for bearer; OAuth requires stable HTTPS publicUrl. Named fixed domain via existing token OR browser login + create tunnel + DNS. Never imply a copied URL is online before diagnostic verification. Failed tunnel leaves local service running. First-run flow: choose folder, local/remote, create, start, copy endpoint. No mock statuses in production; browser-only preview must explicitly say it is a preview with no backend.
+Defaults: first workspace local, safe, noauth, port 0, no custom core command. Remote access requires bearer, url-token, basic or OAuth. Quick Tunnel is temporary and suitable for bearer, url-token and basic; OAuth requires stable HTTPS publicUrl. url-token (`?token=`) and basic are enforced by the desktop gateway on the workspace port, in front of a core on a private loopback port. Named fixed domain via existing token OR browser login + create tunnel + DNS. Never imply a copied URL is online before diagnostic verification. Failed tunnel leaves local service running. First-run flow: choose folder, local/remote, create, start, copy endpoint. No mock statuses in production; browser-only preview must explicitly say it is a preview with no backend.
 
-- auth_details({ id }) -> { auth: string, bearerToken?: string, oauthPassword?: string }; explicit reveal only.
+- auth_details({ id }) -> { auth: string, bearerToken?: string, urlToken?: string, basicUsername?: string, basicPassword?: string, oauthPassword?: string }; explicit reveal only.
 
 Capability note: published PyPI core 0.5.0 lacks tool events. The desktop never synthesizes records or silently installs a Git checkout. Exact official commit d7c2dda48bcedbd066c7dbc24a1b63205384d269 supports the event journal and is separately validated. Each launched core receives a fresh journal directory; the previous three runs are retained.
 

@@ -1,5 +1,6 @@
 use crate::{
     core, events,
+    gateway::{self, Credential, Gateway},
     model::*,
     process::ManagedProcess,
     storage::{private_json, valid_id, Storage},
@@ -22,6 +23,8 @@ use std::{
 #[derive(Default)]
 struct Session {
     runtime: Option<ManagedProcess>,
+    // Owns the workspace port while a gateway-enforced mode is running.
+    gateway: Option<Gateway>,
     tunnel: Option<ManagedProcess>,
     public_url: String,
     last_local_probe: Option<Instant>,
@@ -104,6 +107,19 @@ fn local_listener(port: u16) -> std::io::Result<TcpListener> {
     }
 }
 
+/// A free loopback port for a core that only the gateway may reach.
+fn private_port(config: &Config) -> Result<u16> {
+    for _ in 0..32 {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
+            .local_addr()?
+            .port();
+        if !config.workspaces.iter().any(|w| w.port == port) {
+            return Ok(port);
+        }
+    }
+    bail!("No available local port for the core")
+}
+
 fn confirm_port_release(port: u16) -> Result<()> {
     let until = Instant::now() + Duration::from_secs(4);
     loop {
@@ -166,8 +182,15 @@ fn validate_access(w: &Workspace, starting: bool) -> Result<()> {
     if !["local", "quick", "named", "frp"].contains(&w.access.as_str()) {
         bail!("Unknown access mode");
     }
-    if !["noauth", "bearer", "oauth"].contains(&w.auth.as_str()) {
+    if !["noauth", "bearer", "url-token", "basic", "oauth"].contains(&w.auth.as_str()) {
         bail!("Unknown authentication mode");
+    }
+    if w.auth == "basic"
+        && (w.basic_username.is_empty()
+            || w.basic_username.chars().count() > 128
+            || w.basic_username.chars().any(|c| c == ':' || c.is_control()))
+    {
+        bail!("Enter a username of 1 to 128 characters without a colon");
     }
     if !["safe", "trusted"].contains(&w.permission_mode.as_str()) {
         bail!("Choose safe or trusted permissions before starting this workspace");
@@ -357,6 +380,9 @@ impl Manager {
             bail!("Enter a workspace name of 1 to 120 characters");
         }
         w.path = validate_workspace_folder(&w.path)?;
+        if w.basic_username.trim().is_empty() {
+            w.basic_username = gateway::DEFAULT_USERNAME.into();
+        }
         validate_access(&w, false)?;
         if ["named", "frp"].contains(&w.access.as_str()) && !w.public_url.is_empty() {
             tunnel::validate_public_url(&w.public_url)?;
@@ -417,6 +443,19 @@ impl Manager {
                 bail!("Credential exceeds maximum length");
             }
             s.merge(input);
+        }
+        // Profiles saved before a mode existed have no credential for it yet.
+        if w.auth != "noauth" && s.bearer_token.is_empty() {
+            s.bearer_token = Secrets::generate();
+        }
+        if w.auth == "basic" && s.basic_password.is_empty() {
+            s.basic_password = Secrets::generate();
+        }
+        if [&s.bearer_token, &s.basic_password]
+            .iter()
+            .any(|secret| secret.chars().any(char::is_control))
+        {
+            bail!("Credential contains characters that cannot be sent in a header");
         }
         w.token_configured = !s.cloudflare_token.is_empty();
         if let Some(old) = next.workspaces.iter_mut().find(|x| x.id == w.id) {
@@ -504,6 +543,7 @@ impl Manager {
                 old.stop().context("Could not clean up the previous core")?;
             }
             session.runtime = None;
+            session.gateway = None;
             session.public_url.clear();
             session.last_local_probe = None;
             *slot.run_started_ms.lock().unwrap() = None;
@@ -521,8 +561,12 @@ impl Manager {
             if w.port == 0 {
                 bail!("Workspace port is not configured; save the workspace to allocate it");
             }
-            if w.auth == "bearer" && secrets.bearer_token.is_empty() {
+            let credential = Credential::for_workspace(&w, &secrets);
+            if (w.auth == "bearer" || credential.is_some()) && secrets.bearer_token.is_empty() {
                 bail!("Bearer credential is missing; save the workspace to generate one");
+            }
+            if w.auth == "basic" && secrets.basic_password.is_empty() {
+                bail!("Password is missing; save the workspace to generate one");
             }
             if w.auth == "oauth"
                 && (secrets.oauth_password.is_empty() || secrets.oauth_token_secret.is_empty())
@@ -539,9 +583,21 @@ impl Manager {
                 _ => anyhow!("Could not check whether this port is available: {error}"),
             })?;
             drop(port);
+            // The core cannot check these credentials. It moves to a private
+            // loopback port with a bearer token only the gateway presents, and
+            // the gateway answers on the workspace port in its place.
+            let mut core_view = w.clone();
+            if let Some(credential) = credential {
+                core_view.auth = "bearer".into();
+                core_view.port = private_port(&self.config())?;
+                session.gateway = Some(
+                    Gateway::start(w.port, core_view.port, credential, &secrets.bearer_token)
+                        .context("Could not start the authentication gateway")?,
+                );
+            }
             events::begin_run(&state)?;
             let mut cmd = core::command_supervised(
-                &w,
+                &core_view,
                 &secrets,
                 &self.config(),
                 &state,
@@ -635,6 +691,7 @@ impl Manager {
         })();
         if let Err(e) = result {
             let mut message = events::redact(&format!("{e:#}"), &secrets);
+            session.gateway = None;
             if spawned {
                 if let Some(process) = session.runtime.as_mut() {
                     match process.stop() {
@@ -818,6 +875,9 @@ impl Manager {
                 p.stop()?;
             }
             session.tunnel = None;
+            // Stop answering before the core goes away, and free the port
+            // whose release is confirmed below.
+            session.gateway = None;
             if let Some(p) = session.runtime.as_mut() {
                 p.stop()?;
             }
@@ -895,8 +955,10 @@ impl Manager {
             let Ok((w, secret)) = self.workspace(&w.id) else {
                 continue;
             };
+            let session = &mut *session;
             if let Some(p) = session.runtime.as_mut() {
                 if !p.alive() {
+                    session.gateway = None;
                     let mut cleanup_errors = Vec::new();
                     let note = exit_note(p.exit_code());
                     match p.stop() {
@@ -1188,8 +1250,23 @@ impl Manager {
             (w, s, endpoint)
         };
         let mut entry = json!({"url":endpoint});
-        if w.auth == "bearer" {
-            entry["headers"] = json!({"Authorization":format!("Bearer {}",s.bearer_token)});
+        match w.auth.as_str() {
+            "bearer" => {
+                entry["headers"] = json!({"Authorization":format!("Bearer {}",s.bearer_token)});
+            }
+            "url-token" => {
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair(gateway::TOKEN_PARAM, &s.bearer_token)
+                    .finish();
+                entry["url"] = json!(format!("{endpoint}?{query}"));
+            }
+            "basic" => {
+                use base64::Engine;
+                let pair = format!("{}:{}", w.basic_username, s.basic_password);
+                let encoded = base64::engine::general_purpose::STANDARD.encode(pair);
+                entry["headers"] = json!({"Authorization":format!("Basic {encoded}")});
+            }
+            _ => {}
         }
         Ok(serde_json::to_string_pretty(
             &json!({"mcpServers":{w.name:entry}}),
@@ -1200,6 +1277,10 @@ impl Manager {
         Ok(match w.auth.as_str() {
             "oauth" => json!({"auth":"oauth","oauthPassword":s.oauth_password}),
             "bearer" => json!({"auth":"bearer","bearerToken":s.bearer_token}),
+            "url-token" => json!({"auth":"url-token","urlToken":s.bearer_token}),
+            "basic" => {
+                json!({"auth":"basic","basicUsername":w.basic_username,"basicPassword":s.basic_password})
+            }
             _ => json!({"auth":"noauth"}),
         })
     }

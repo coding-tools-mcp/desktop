@@ -75,6 +75,13 @@ const zh: Record<string, string> = {
     "尚未配置工作区端口，请保存工作区以分配端口。",
   "Bearer credential is missing; save the workspace to generate one":
     "缺少 Bearer 凭据，请保存工作区以生成凭据。",
+  "Password is missing; save the workspace to generate one":
+    "缺少密码，请保存工作区以生成密码。",
+  "Enter a username of 1 to 128 characters without a colon":
+    "请输入 1 到 128 个字符且不含冒号的用户名。",
+  "Credential contains characters that cannot be sent in a header":
+    "凭据包含无法通过请求头发送的字符。",
+  "Could not start the authentication gateway": "无法启动身份验证网关。",
   "OAuth credentials are missing; repair the workspace configuration":
     "缺少 OAuth 凭据，请修复工作区配置。",
   "Workspace operation is in progress": "工作区正在进行其他操作，请稍后重试。",
@@ -302,6 +309,15 @@ const zh: Record<string, string> = {
   "No authentication (local only)": "无需认证（仅本地）",
   "Bearer token": "Bearer 令牌",
   "Browser sign-in (OAuth)": "浏览器登录（OAuth）",
+  "Token in URL": "URL 令牌（?token=）",
+  "Username and password": "用户名和密码",
+  "URL token": "URL 令牌",
+  Username: "用户名",
+  Password: "密码",
+  "For clients that cannot send an Authorization header. The token is part of the address, so keep the whole URL private.":
+    "适用于无法发送 Authorization 请求头的客户端。令牌包含在地址中，请将整个 URL 视为机密。",
+  "For clients that sign in with HTTP Basic authentication.":
+    "适用于使用 HTTP Basic 认证登录的客户端。",
   "Permission mode": "权限模式",
   "Allow tools to modify files": "允许工具修改文件",
   "Safe mode allows file edits with stricter execution checks. Only enable trusted mode for code you trust.":
@@ -329,8 +345,7 @@ const zh: Record<string, string> = {
   "Name and folder are required.": "请填写名称和文件夹。",
   "Remote access requires authentication.": "公网访问需要身份验证。",
   "OAuth requires a stable HTTPS URL.": "OAuth 需要固定的 HTTPS 地址。",
-  "Quick Tunnel supports bearer authentication only.":
-    "Quick Tunnel 仅支持 Bearer 认证。",
+  "Username cannot contain a colon.": "用户名不能包含冒号。",
   "Select a folder first.": "请先选择文件夹。",
   "Remove this workspace?": "移除此工作区？",
   "This removes the saved configuration. Your source files are never deleted. Backups and logs are retained.":

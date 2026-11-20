@@ -8,7 +8,8 @@ export interface Workspace {
   port: number;
   access: Access;
   publicUrl: string;
-  auth: "noauth" | "bearer" | "oauth";
+  auth: "noauth" | "bearer" | "url-token" | "basic" | "oauth";
+  basicUsername: string;
   permissionMode: "safe" | "trusted";
   coreCommand: string[];
   coreVersion: string;
@@ -18,6 +19,7 @@ export interface Workspace {
 }
 export interface Secrets {
   bearerToken?: string;
+  basicPassword?: string;
   oauthPassword?: string;
   cloudflareToken?: string;
 }
@@ -83,6 +85,7 @@ export interface Logs {
   cursor: number;
   truncated: boolean;
 }
+export const DEFAULT_BASIC_USERNAME = "ctc";
 export const blankWorkspace = (): Workspace => ({
   id: "",
   name: "",
@@ -91,6 +94,7 @@ export const blankWorkspace = (): Workspace => ({
   access: "local",
   publicUrl: "",
   auth: "noauth",
+  basicUsername: DEFAULT_BASIC_USERNAME,
   permissionMode: "safe",
   coreCommand: [],
   coreVersion: RECOMMENDED_CORE_VERSION,
@@ -108,5 +112,8 @@ export const errorText = (error: unknown) =>
 export interface AuthDetails {
   auth: string;
   bearerToken?: string;
+  urlToken?: string;
+  basicUsername?: string;
+  basicPassword?: string;
   oauthPassword?: string;
 }

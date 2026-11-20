@@ -308,9 +308,13 @@ pub fn probe(w: &Workspace, secrets: &Secrets, public: bool) -> Result<String> {
         ));
     }
     let mut request=c.post(format!("{base}/mcp")).header("Accept","application/json, text/event-stream").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"coding-tools-mcp-desktop-health","version":"0.2.0"}}}));
-    if w.auth == "bearer" {
-        request = request.bearer_auth(&secrets.bearer_token);
-    }
+    request = match w.auth.as_str() {
+        // The desktop gateway accepts the URL token as a bearer value too,
+        // which keeps the credential out of the request line.
+        "bearer" | "url-token" => request.bearer_auth(&secrets.bearer_token),
+        "basic" => request.basic_auth(&w.basic_username, Some(&secrets.basic_password)),
+        _ => request,
+    };
     let response = request.send()?;
     if w.auth == "oauth" && response.status() == 401 {
         return Ok(format!(

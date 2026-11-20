@@ -381,7 +381,11 @@ export function ConnectionsPage({
                     ? "Browser sign-in (OAuth)"
                     : workspace.auth === "bearer"
                       ? "Bearer token"
-                      : "No authentication (local only)",
+                      : workspace.auth === "url-token"
+                        ? "Token in URL"
+                        : workspace.auth === "basic"
+                          ? "Username and password"
+                          : "No authentication (local only)",
                 )}
               </Text>
             </div>
@@ -408,7 +412,7 @@ export function ConnectionsPage({
             )}
           </Text>
         )}
-        {workspace.auth === "bearer" && (
+        {["bearer", "url-token", "basic"].includes(workspace.auth) && (
           <Text size="xs" c="dimmed" mt="xs">
             {t("Configuration may contain credentials. Keep it private.")}
           </Text>
@@ -590,6 +594,29 @@ export function ConnectionsPage({
               t={t}
               label={t("Bearer token")}
               value={credentials.bearerToken}
+              readOnly
+            />
+          )}
+          {credentials?.urlToken && (
+            <SecretInput
+              t={t}
+              label={t("URL token")}
+              value={credentials.urlToken}
+              readOnly
+            />
+          )}
+          {credentials?.basicUsername && (
+            <TextInput
+              label={t("Username")}
+              value={credentials.basicUsername}
+              readOnly
+            />
+          )}
+          {credentials?.basicPassword && (
+            <SecretInput
+              t={t}
+              label={t("Password")}
+              value={credentials.basicPassword}
               readOnly
             />
           )}

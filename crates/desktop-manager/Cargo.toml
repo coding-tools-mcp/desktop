@@ -20,6 +20,12 @@ shell-words = "1"
 regex = "1"
 tempfile = "3"
 url = "2"
+base64 = "0.22"
+subtle = "2"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

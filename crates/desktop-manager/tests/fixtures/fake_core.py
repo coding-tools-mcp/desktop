@@ -21,11 +21,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def send_seen(self):
+        # Lets gateway tests assert what was actually forwarded to the core.
+        self.send_header('X-Fixture-Target', self.path)
+        self.send_header('X-Fixture-Credential', '1' if self.headers.get('Authorization') else '0')
+
     def do_GET(self):
         data = {'server': {'name': 'coding-tools-mcp', 'version': '0.5.0'},
                 'transport': {'endpoint': '/mcp'}}
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
+        self.send_seen()
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -42,6 +48,7 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get('Content-Length', 0)))
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
+        self.send_seen()
         self.end_headers()
         self.wfile.write(b'{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"coding-tools-mcp","version":"0.5.0"}}}')
 
