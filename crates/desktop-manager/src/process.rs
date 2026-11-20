@@ -18,6 +18,45 @@ use std::{
 use sysinfo::Signal;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
+/// Children of `root`, found with one small read per process. sysinfo's full
+/// refresh also walks every thread and keeps a descriptor open per entry,
+/// which is far too expensive at the supervisor's polling cadence.
+#[cfg(target_os = "linux")]
+fn linux_descendants(root: u32) -> Vec<u32> {
+    let mut parents = std::collections::HashMap::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // The command name may contain spaces or parentheses; fields resume
+        // after its final closing parenthesis: state, then parent PID.
+        let parent = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok());
+        if let Some(parent) = parent {
+            parents.insert(pid, parent);
+        }
+    }
+    let mut found = vec![];
+    let mut pending = vec![root];
+    while let Some(parent) = pending.pop() {
+        for (pid, _) in parents.iter().filter(|(_, p)| **p == parent) {
+            if *pid != root && !found.contains(pid) {
+                found.push(*pid);
+                pending.push(*pid);
+            }
+        }
+    }
+    found
+}
+
 /// Construct the command before applying argv, environment (including
 /// env_clear), or current_dir, so wrapping never reconstructs those settings.
 /// The supervisor executable must be an absolute path to this native binary.
@@ -170,9 +209,16 @@ impl ManagedProcess {
         } else {
             vec![]
         };
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-        Ok(Self {
+        // Do not cache one /proc descriptor per observed process.
+        #[cfg(target_os = "linux")]
+        {
+            static LIMIT: std::sync::Once = std::sync::Once::new();
+            LIMIT.call_once(|| {
+                sysinfo::set_open_files_limit(0);
+            });
+        }
+        let system = System::new();
+        let mut process = Self {
             child,
             started: Instant::now(),
             reaped: false,
@@ -183,7 +229,33 @@ impl ManagedProcess {
             supervised,
             #[cfg(windows)]
             job,
-        })
+        };
+        process.refresh_processes();
+        Ok(process)
+    }
+    /// Refresh only this process tree on Linux; other platforms have no
+    /// comparably cheap parent listing and keep the full process refresh.
+    fn refresh_processes(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let mut pids: Vec<Pid> = linux_descendants(self.pid())
+                .into_iter()
+                .chain(self.descendants.iter().map(|(pid, _)| *pid))
+                .chain([self.pid()])
+                .map(Pid::from_u32)
+                .collect();
+            pids.sort();
+            pids.dedup();
+            self.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&pids),
+                true,
+                sysinfo::ProcessRefreshKind::nothing()
+                    .with_cpu()
+                    .with_memory(),
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.system.refresh_processes(ProcessesToUpdate::All, true);
     }
     #[cfg(unix)]
     fn exit_info(&mut self) -> Option<libc::siginfo_t> {
@@ -213,16 +285,22 @@ impl ManagedProcess {
             Some(info)
         }
     }
-    #[cfg(unix)]
     pub(crate) fn exit_code(&mut self) -> Option<i32> {
-        self.exit_info().map(|s| {
-            let status = unsafe { s.si_status() };
-            if s.si_code == libc::CLD_EXITED {
-                status
-            } else {
-                128 + status
-            }
-        })
+        #[cfg(unix)]
+        {
+            self.exit_info().map(|s| {
+                let status = unsafe { s.si_status() };
+                if s.si_code == libc::CLD_EXITED {
+                    status
+                } else {
+                    128 + status
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.try_wait().ok().flatten().and_then(|s| s.code())
+        }
     }
     pub fn succeeded(&mut self) -> bool {
         #[cfg(unix)]
@@ -255,12 +333,15 @@ impl ManagedProcess {
         }
     }
     pub fn metrics(&mut self) -> (f32, u64) {
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
+        self.refresh_processes();
         let mut parents = vec![self.pid()];
         let mut seen = vec![];
         while let Some(pid) = parents.pop() {
             for (id, p) in self.system.processes() {
-                if p.parent().map(|p| p.as_u32()) == Some(pid)
+                // Linux lists threads as tasks sharing their process's memory;
+                // counting them would multiply the reported usage.
+                if p.thread_kind().is_none()
+                    && p.parent().map(|p| p.as_u32()) == Some(pid)
                     && !seen.iter().any(|(x, _)| *x == id.as_u32())
                 {
                     seen.push((id.as_u32(), p.start_time()));
@@ -362,7 +443,7 @@ impl ManagedProcess {
             }
             // Also clean children that left the original group but were observed.
             // Every independently signaled PID still requires its original birth time.
-            self.system.refresh_processes(ProcessesToUpdate::All, true);
+            self.refresh_processes();
             for (pid, start) in self.descendants.iter().rev() {
                 if self.identity_matches(*pid, *start) {
                     if let Some(p) = self.system.process(Pid::from_u32(*pid)) {
