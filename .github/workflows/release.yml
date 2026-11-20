@@ -9,18 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    uses: ./.github/workflows/ci.yml
-
-  publish:
-    needs: quality
+  tag:
+    name: Tag matches the package version
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/coding-tools-mcp-desktop/
-    permissions:
-      id-token: write
-      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -39,6 +30,54 @@ jobs:
           if actual != expected:
               raise SystemExit(f"release tag {actual!r} must match {expected!r}")
           PY
+
+  quality:
+    uses: ./.github/workflows/ci.yml
+
+  bundles:
+    uses: ./.github/workflows/native-bundles.yml
+
+  installers:
+    name: GitHub Release with installers
+    needs: [tag, quality, bundles]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: native-bundles-*
+          path: installers
+      - name: Attach the installers to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -d '' files < <(find installers -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
+               -o -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' \) -print0)
+          printf '%s\n' "${files[@]}"
+          for suffix in .deb .rpm .AppImage aarch64.dmg x64.dmg .msi -setup.exe; do
+            printf '%s\n' "${files[@]}" | grep -q -- "$suffix\$" || { echo "Missing installer: *$suffix"; exit 1; }
+          done
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" --clobber "${files[@]}"
+
+  publish:
+    needs: [tag, quality]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/coding-tools-mcp-desktop/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - run: python -m pip install --upgrade pip build twine
       - run: python -m build
       - run: python -m twine check dist/*
