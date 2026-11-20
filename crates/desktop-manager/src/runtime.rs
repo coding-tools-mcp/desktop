@@ -562,7 +562,8 @@ impl Manager {
                 bail!("Workspace port is not configured; save the workspace to allocate it");
             }
             let credential = Credential::for_workspace(&w, &secrets);
-            if (w.auth == "bearer" || credential.is_some()) && secrets.bearer_token.is_empty() {
+            if ["bearer", "url-token"].contains(&w.auth.as_str()) && secrets.bearer_token.is_empty()
+            {
                 bail!("Bearer credential is missing; save the workspace to generate one");
             }
             if w.auth == "basic" && secrets.basic_password.is_empty() {
@@ -584,21 +585,30 @@ impl Manager {
             })?;
             drop(port);
             // The core cannot check these credentials. It moves to a private
-            // loopback port with a bearer token only the gateway presents, and
-            // the gateway answers on the workspace port in its place.
+            // loopback port and the gateway answers on the workspace port in
+            // its place. The token between them is new for every start and
+            // never saved, so no credential a client ever held reaches the
+            // core directly.
             let mut core_view = w.clone();
+            let mut core_secrets = secrets.clone();
             if let Some(credential) = credential {
                 core_view.auth = "bearer".into();
                 core_view.port = private_port(&self.config())?;
+                core_secrets.bearer_token = Secrets::generate();
                 session.gateway = Some(
-                    Gateway::start(w.port, core_view.port, credential, &secrets.bearer_token)
-                        .context("Could not start the authentication gateway")?,
+                    Gateway::start(
+                        w.port,
+                        core_view.port,
+                        credential,
+                        &core_secrets.bearer_token,
+                    )
+                    .context("Could not start the authentication gateway")?,
                 );
             }
             events::begin_run(&state)?;
             let mut cmd = core::command_supervised(
                 &core_view,
-                &secrets,
+                &core_secrets,
                 &self.config(),
                 &state,
                 self.supervisor.as_deref(),
@@ -608,14 +618,14 @@ impl Manager {
                 ManagedProcess::spawn_supervised(
                     &mut cmd,
                     state.join("runtime.log"),
-                    secrets.clone(),
+                    core_secrets.clone(),
                 )?
             } else {
-                ManagedProcess::spawn(&mut cmd, state.join("runtime.log"), secrets.clone())?
+                ManagedProcess::spawn(&mut cmd, state.join("runtime.log"), core_secrets.clone())?
             };
             #[cfg(not(unix))]
             let process =
-                ManagedProcess::spawn(&mut cmd, state.join("runtime.log"), secrets.clone())?;
+                ManagedProcess::spawn(&mut cmd, state.join("runtime.log"), core_secrets.clone())?;
             // Transfer ownership before readiness. If startup or cleanup fails,
             // Stop/Quit must still be able to retry this exact process handle.
             session.runtime = Some(process);

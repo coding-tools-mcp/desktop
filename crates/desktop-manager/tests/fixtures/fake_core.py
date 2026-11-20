@@ -25,6 +25,7 @@ class Handler(BaseHTTPRequestHandler):
         # Lets gateway tests assert what was actually forwarded to the core.
         self.send_header('X-Fixture-Target', self.path)
         self.send_header('X-Fixture-Credential', '1' if self.headers.get('Authorization') else '0')
+        self.send_header('X-Fixture-Port', str(self.server.server_address[1]))
 
     def do_GET(self):
         data = {'server': {'name': 'coding-tools-mcp', 'version': '0.5.0'},

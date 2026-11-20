@@ -401,6 +401,14 @@ fn url_token_is_enforced_before_the_core_and_never_forwarded() {
 fn basic_is_enforced_before_the_core() {
     let (_test_guard, d, m) = manager();
     let mut w = workspace(d.path());
+    // The bearer token was handed to clients before the switch to Basic.
+    w.auth = "bearer".into();
+    let shared = "token-shared-before-the-switch";
+    let secrets = Secrets {
+        bearer_token: shared.into(),
+        ..Default::default()
+    };
+    let mut w = m.save_workspace(w, Some(secrets)).unwrap();
     w.auth = "basic".into();
     w.basic_username = "  ".into();
     let w = m.save_workspace(w, None).unwrap();
@@ -446,6 +454,16 @@ fn basic_is_enforced_before_the_core() {
         .send()
         .unwrap();
     assert_eq!(accepted.status(), 200);
+    // Neither that old token nor the password opens the core's own port.
+    let core_port = accepted.headers()["x-fixture-port"].to_str().unwrap();
+    assert_ne!(core_port, w.port.to_string());
+    for stale in [shared, password.as_str()] {
+        let direct = initialize(&client, &format!("http://127.0.0.1:{core_port}/mcp"))
+            .bearer_auth(stale)
+            .send()
+            .unwrap();
+        assert_eq!(direct.status(), 401);
+    }
     let entry = entry(&m, &w);
     assert_eq!(entry["url"], url);
     let configured = initialize(&client, &url)
