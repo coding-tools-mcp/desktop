@@ -213,9 +213,8 @@ export function CallList({
     </div>
   );
 }
-/** The address a client can paste as is: a URL-token workspace needs its token in it. */
-export async function clientEndpoint(workspace: Workspace, endpoint: string) {
-  if (workspace.auth !== "url-token") return endpoint;
+/** The address a URL-token client can paste as is: the endpoint with its token. */
+export async function tokenEndpoint(workspace: Workspace, endpoint: string) {
   const { urlToken } = await api.authDetails(workspace.id);
   if (!urlToken) throw new Error("Credentials are unavailable");
   return `${endpoint}?${new URLSearchParams({ token: urlToken })}`;

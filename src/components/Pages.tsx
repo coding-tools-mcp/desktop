@@ -57,11 +57,11 @@ import { translator, type Translate } from "../i18n";
 import type { RunAction } from "../App";
 import {
   CallList,
-  clientEndpoint,
   Empty,
   EndpointCard,
   SectionHead,
   TOKEN_ENDPOINT_COPIED,
+  tokenEndpoint,
 } from "./Common";
 import { ConfirmModal } from "./WorkspaceModal";
 function configWarning(
@@ -183,14 +183,12 @@ export function ConnectionsPage({
     }
   }
   async function copyEndpoint(endpoint: string) {
+    // Only a URL token needs a lookup; every other address is copied at once.
+    if (workspace.auth !== "url-token") return onCopy(endpoint);
     const result = await run("copy-endpoint", () =>
-      clientEndpoint(workspace, endpoint),
+      tokenEndpoint(workspace, endpoint),
     );
-    if (result)
-      await onCopy(
-        result,
-        result === endpoint ? undefined : t(TOKEN_ENDPOINT_COPIED),
-      );
+    if (result) await onCopy(result, t(TOKEN_ENDPOINT_COPIED));
   }
   async function showCredentials() {
     const result = await run("credentials", () =>

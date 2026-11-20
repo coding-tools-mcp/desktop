@@ -638,16 +638,19 @@ describe("desktop rendered flows through mocked Tauri invoke", () => {
       "Copied with its token. Keep this address private.",
     );
   });
-  it("copies other endpoints without asking for credentials", async () => {
+  it("copies other endpoints within the click, with no lookup", async () => {
     await dashboard();
-    await userEvent.click(
-      screen.getAllByRole("button", { name: "Copy endpoint" })[0],
-    );
-    await waitFor(() =>
-      expect(clipboard).toHaveBeenLastCalledWith(
+    for (const page of ["Dashboard", "Connections"]) {
+      if (page !== "Dashboard") await navigate(page);
+      clipboard.mockClear();
+      // The clipboard may only be written during the click itself.
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "Copy endpoint" })[0],
+      );
+      expect(clipboard).toHaveBeenCalledWith(
         snapshot.statuses[0].localEndpoint,
-      ),
-    );
+      );
+    }
     expect(count("auth_details")).toBe(0);
   });
   it("reveals the credentials that belong to the selected method", async () => {

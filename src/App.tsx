@@ -48,12 +48,12 @@ import type { Operation } from "./operations";
 import { translator } from "./i18n";
 import {
   CallList,
-  clientEndpoint,
   EndpointCard,
   formatDuration,
   formatTime,
   StateBadge,
   TOKEN_ENDPOINT_COPIED,
+  tokenEndpoint,
 } from "./components/Common";
 import { ConfirmModal, WorkspaceModal } from "./components/WorkspaceModal";
 import {
@@ -353,15 +353,12 @@ export default function App() {
   const runWorkspace: RunAction = (key, fn, success) =>
     run(key, fn, success, workspace?.id);
   async function copyEndpoint(endpoint: string) {
-    if (!workspace) return;
+    // Only a URL token needs a lookup; every other address is copied at once.
+    if (workspace?.auth !== "url-token") return copy(endpoint);
     const result = await runWorkspace("copy-endpoint", () =>
-      clientEndpoint(workspace, endpoint),
+      tokenEndpoint(workspace, endpoint),
     );
-    if (result)
-      await copy(
-        result,
-        result === endpoint ? undefined : t(TOKEN_ENDPOINT_COPIED),
-      );
+    if (result) await copy(result, t(TOKEN_ENDPOINT_COPIED));
   }
   async function copy(value: string, success = t("Copied")) {
     const sequence = ++feedbackRequest.current;
