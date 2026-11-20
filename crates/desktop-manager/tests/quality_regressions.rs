@@ -122,6 +122,46 @@ fn probe_fixture(oversized_initialize: bool, advertised: bool) -> anyhow::Result
 }
 
 #[test]
+fn a_failed_health_check_does_not_repeat_the_url_token() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let card = json!({"server":{"name":"coding-tools-mcp","version":"0.5.0"},"transport":{"endpoint":"/mcp"}}).to_string();
+        for (status, body) in [("200 OK", card.as_str()), ("401 Unauthorized", "")] {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = BufReader::new(&mut connection);
+            let mut line = String::new();
+            while line != "\r\n" {
+                line.clear();
+                request.read_line(&mut line).unwrap();
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = connection.write_all(response.as_bytes());
+        }
+    });
+    let workspace: Workspace = serde_json::from_value(
+        json!({"name":"Probe fixture","path":".","port":port,"auth":"url-token"}),
+    )
+    .unwrap();
+    let secrets = Secrets {
+        bearer_token: "PROBE-ONLY-TOKEN".into(),
+        ..Default::default()
+    };
+    let error = format!(
+        "{:#}",
+        core::probe(&workspace, &secrets, false).unwrap_err()
+    );
+    server.join().unwrap();
+    assert!(error.contains("401"), "{error}");
+    assert!(error.contains(&format!("127.0.0.1:{port}/mcp")), "{error}");
+    assert!(!error.contains("PROBE-ONLY-TOKEN"), "{error}");
+    assert!(!error.contains("token="), "{error}");
+}
+
+#[test]
 fn discovery_rejects_oversized_advertised_and_streamed_json() {
     for advertised in [true, false] {
         let error = probe_fixture(false, advertised).unwrap_err();

@@ -266,8 +266,15 @@ pub fn client() -> Result<Client> {
 // declared and streamed bodies, including configured public endpoints, before
 // allocating/deserializing arbitrary server output.
 const PROBE_BODY_LIMIT: u64 = 1024 * 1024;
+/// A request error names its URL, and a URL token travels in the query.
+fn without_query(mut error: reqwest::Error) -> reqwest::Error {
+    if let Some(url) = error.url_mut() {
+        url.set_query(None);
+    }
+    error
+}
 fn probe_json(response: reqwest::blocking::Response) -> Result<Value> {
-    let response = response.error_for_status()?;
+    let response = response.error_for_status().map_err(without_query)?;
     if response
         .content_length()
         .is_some_and(|size| size > PROBE_BODY_LIMIT)
@@ -320,7 +327,7 @@ pub fn probe(w: &Workspace, secrets: &Secrets, public: bool) -> Result<String> {
         "basic" => request.basic_auth(&w.basic_username, Some(&secrets.basic_password)),
         _ => request,
     };
-    let response = request.send()?;
+    let response = request.send().map_err(without_query)?;
     if w.auth == "oauth" && response.status() == 401 {
         return Ok(format!(
             "Core {version} is reachable; OAuth authorization is required"
