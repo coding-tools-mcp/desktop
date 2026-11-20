@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coding-tools-mcp-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "Desktop application for running and managing Coding Tools MCP."
 requires-python = ">=3.11"
 dependencies = []
