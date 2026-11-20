@@ -10,7 +10,7 @@ use crate::model::{Secrets, Workspace};
 use base64::Engine;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
-    body::{Bytes, Incoming},
+    body::{Bytes, Frame, Incoming, SizeHint},
     header::{self, HeaderMap, HeaderName, HeaderValue},
     Method, Request, Response, StatusCode, Uri, Version,
 };
@@ -20,8 +20,11 @@ use hyper_util::{
 };
 use std::{
     convert::Infallible,
+    future::Future,
     net::{Ipv4Addr, TcpListener},
+    pin::Pin,
     sync::Arc,
+    task::Poll,
     thread::JoinHandle,
     time::Duration,
 };
@@ -32,6 +35,7 @@ pub const TOKEN_PARAM: &str = "token";
 pub const DEFAULT_USERNAME: &str = "ctc";
 const MAX_CONNECTIONS: usize = 256;
 const REALM: &str = "coding-tools-mcp";
+const BODY_IDLE: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 30_000 });
 
 /// What a client must present to this gateway.
 #[derive(Clone)]
@@ -184,11 +188,47 @@ fn message(status: StatusCode, text: &str, challenge: Option<String>) -> Respons
     response
 }
 
+/// A request body that fails once the client sends nothing for `BODY_IDLE`,
+/// so a stalled upload cannot keep its connection slot.
+struct Upload {
+    body: Incoming,
+    idle: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl hyper::body::Body for Upload {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        match Pin::new(&mut self.body).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                let next = tokio::time::Instant::now() + BODY_IDLE;
+                self.idle.as_mut().reset(next);
+                Poll::Ready(frame.map(|frame| frame.map_err(Into::into)))
+            }
+            Poll::Pending => self
+                .idle
+                .as_mut()
+                .poll(cx)
+                .map(|()| Some(Err("request body stalled".into()))),
+        }
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
 struct Context {
     upstream: u16,
     credential: Credential,
     bearer: HeaderValue,
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, Upload>,
 }
 
 async fn forward(
@@ -219,6 +259,10 @@ async fn forward(
     if accepted {
         headers.insert(header::AUTHORIZATION, context.bearer.clone());
     }
+    let request = request.map(|body| Upload {
+        body,
+        idle: Box::pin(tokio::time::sleep(BODY_IDLE)),
+    });
     Ok(match context.client.request(request).await {
         Ok(upstream) => {
             let (mut parts, body) = upstream.into_parts();
@@ -470,6 +514,45 @@ mod tests {
         drop(gateway);
         assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
         assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+    }
+
+    #[test]
+    fn a_stalled_upload_gives_its_connection_back() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // A core that waits for the whole body before it answers.
+        let core = std::thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest);
+        });
+        let _gateway = Gateway::start(
+            port,
+            upstream_port,
+            Credential::UrlToken("t0ken".into()),
+            "internal",
+        )
+        .unwrap();
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client
+            .write_all(b"POST /mcp?token=t0ken HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab")
+            .unwrap();
+        let mut response = String::new();
+        // Reaching end of stream means the gateway closed the connection.
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        core.join().unwrap();
     }
 
     #[test]
