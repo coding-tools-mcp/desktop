@@ -109,6 +109,7 @@ fn parse_legacy_command(command: &str, windows: bool) -> Result<Vec<String>> {
 }
 pub const CONFIG_FILE: &str = "desktop-v2.json";
 pub const CONFIG_BACKUP: &str = "desktop-v2.json.bak";
+const LANGUAGE_FILE: &str = "language";
 
 /// Reported when another running manager holds the configuration lock.
 pub const LOCKED: &str = "Another desktop manager is already using this configuration";
@@ -203,6 +204,11 @@ impl Storage {
         if let Err(error) = private_write(&backup, &next) {
             eprintln!("Could not update the desktop configuration backup: {error}");
         }
+        // Lets recovery dialogs use the saved language when both files are damaged.
+        let language = self.home.join(LANGUAGE_FILE);
+        if fs::read_to_string(&language).ok().as_deref() != Some(&config.settings.language) {
+            let _ = private_write(&language, config.settings.language.as_bytes());
+        }
         Ok(())
     }
     pub fn backup_preview(&self) -> Option<(std::time::SystemTime, usize)> {
@@ -262,6 +268,7 @@ impl Storage {
             }
             _ => {}
         }
+        let language = Self::preferred_language(&self.home);
         let id = uuid::Uuid::new_v4().simple().to_string();
         for (file, saved) in [
             (CONFIG_FILE, format!("desktop-v2.invalid-{id}.json")),
@@ -274,6 +281,12 @@ impl Storage {
                 _ => {}
             }
         }
+        // Keep the one preference still known; everything else starts empty.
+        if language != Settings::default().language && !self.home.join("profiles.json").exists() {
+            let mut config = Config::default();
+            config.settings.language = language;
+            self.save(&config)?;
+        }
         Ok(())
     }
     /// Language for dialogs shown before the configuration can be loaded.
@@ -281,6 +294,11 @@ impl Storage {
         let saved = [CONFIG_FILE, CONFIG_BACKUP].into_iter().find_map(|file| {
             let value: Value = serde_json::from_slice(&fs::read(home.join(file)).ok()?).ok()?;
             value["settings"]["language"].as_str().map(str::to_owned)
+        });
+        // Both files can be unreadable; the last saved choice is also kept alone.
+        let saved = saved.or_else(|| {
+            let text = fs::read_to_string(home.join(LANGUAGE_FILE)).ok()?;
+            Some(text.trim().to_owned())
         });
         let system = || {
             ["LC_ALL", "LC_MESSAGES", "LANG"]
@@ -445,13 +463,17 @@ mod tests {
     fn start_fresh_keeps_both_damaged_files_and_loads_an_empty_config() {
         let home = tempfile::tempdir().unwrap();
         let storage = Storage::open(home.path().to_owned()).unwrap();
-        storage.save(&Config::default()).unwrap();
+        let mut config = Config::default();
+        config.settings.language = "zh".into();
+        storage.save(&config).unwrap();
         assert!(storage.start_fresh().is_err(), "healthy config must stay");
         std::fs::write(home.path().join(CONFIG_FILE), "{damaged").unwrap();
         std::fs::write(home.path().join(CONFIG_BACKUP), "{also damaged").unwrap();
         assert!(storage.load().is_err());
         storage.start_fresh().unwrap();
-        assert!(storage.load().unwrap().0.workspaces.is_empty());
+        let fresh = storage.load().unwrap().0;
+        assert!(fresh.workspaces.is_empty());
+        assert_eq!(fresh.settings.language, "zh", "saved language was lost");
         let mut kept: Vec<_> = std::fs::read_dir(home.path())
             .unwrap()
             .flatten()

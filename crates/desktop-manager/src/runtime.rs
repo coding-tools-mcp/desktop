@@ -225,8 +225,17 @@ impl Manager {
             bail!("Supervisor must be an absolute executable path");
         }
         let storage = Storage::open(home)?;
-        let (config, migration_notice) = storage.load()?;
+        let (mut config, migration_notice) = storage.load()?;
         core::remove_stale_installs(&storage.home, &config);
+        if config.managed_core.is_none() {
+            if let Some(core) = core::installed_core(&storage.home) {
+                let mut next = config.clone();
+                next.managed_core = Some(core);
+                if storage.save(&next).is_ok() {
+                    config = next;
+                }
+            }
+        }
         Ok(Self {
             storage,
             config: Mutex::new(config),
@@ -1411,9 +1420,17 @@ mod admission_regressions {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         let cores = home.join("cores");
-        for name in ["0.5.0-AbC123", "0.5.0-kept12", "0.5.0-prev12", "custom"] {
+        for name in [
+            "0.5.0-AbC123",
+            "0.5.0-kept12",
+            "0.5.0-prev12",
+            "0.5.0-whole1",
+            "custom",
+        ] {
             std::fs::create_dir_all(cores.join(name).join("bin")).unwrap();
         }
+        // Complete but unreferenced: never an interrupted install.
+        std::fs::write(cores.join("0.5.0-whole1/bin/coding-tools-mcp"), b"").unwrap();
         let core = |name: &str| {
             Some(
                 cores
@@ -1436,7 +1453,47 @@ mod admission_regressions {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, ["0.5.0-kept12", "0.5.0-prev12", "custom"]);
+        assert_eq!(
+            left,
+            ["0.5.0-kept12", "0.5.0-prev12", "0.5.0-whole1", "custom"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_fresh_keeps_an_installed_core_that_the_empty_config_no_longer_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let executable = home.join("cores/0.5.0-AbC123/bin/coding-tools-mcp");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\necho coding-tools-mcp 0.5.0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let storage = Storage::open(home.clone()).unwrap();
+        let config = Config {
+            managed_core: Some(executable.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        storage.save(&config).unwrap();
+        storage.save(&config).unwrap();
+        for file in [crate::storage::CONFIG_FILE, crate::storage::CONFIG_BACKUP] {
+            std::fs::write(home.join(file), "{damaged").unwrap();
+        }
+        storage.start_fresh().unwrap();
+        drop(storage);
+
+        let manager = Manager::load(home, None, None).unwrap();
+        assert!(executable.is_file(), "start fresh deleted a working Core");
+        assert_eq!(
+            manager.config().managed_core.as_deref(),
+            executable.to_str(),
+            "the installed Core must be selected again without a download"
+        );
+        let command = [executable.to_string_lossy().into_owned()];
+        let version = core::version_output(&command, directory.path()).unwrap();
+        assert_eq!(version, "coding-tools-mcp 0.5.0");
     }
 
     #[test]
