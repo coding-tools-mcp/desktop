@@ -8,7 +8,7 @@
 //! still decides what is public. It is not an MCP server and parses no bodies.
 use crate::model::{Secrets, Workspace};
 use base64::Engine;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited};
 use hyper::{
     body::{Bytes, Frame, Incoming, SizeHint},
     header::{self, HeaderMap, HeaderName, HeaderValue},
@@ -35,6 +35,7 @@ pub const TOKEN_PARAM: &str = "token";
 pub const DEFAULT_USERNAME: &str = "ctc";
 const MAX_CONNECTIONS: usize = 256;
 const REALM: &str = "coding-tools-mcp";
+const CARD_PATH: &str = "/.well-known/mcp.json";
 const BODY_IDLE: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 30_000 });
 
 /// What a client must present to this gateway.
@@ -224,6 +225,20 @@ impl hyper::body::Body for Upload {
     }
 }
 
+const UNREACHABLE: &str = "Local MCP core is not reachable";
+
+/// The core's discovery card with its sign-in method replaced by Basic.
+fn basic_card(card: Bytes) -> Bytes {
+    match serde_json::from_slice::<serde_json::Value>(&card) {
+        Ok(mut value) if value.get("auth").is_some() => {
+            value["auth"] =
+                serde_json::json!({"type":"basic","scheme":"Basic","header":"Authorization"});
+            value.to_string().into()
+        }
+        _ => card,
+    }
+}
+
 struct Context {
     upstream: u16,
     credential: Credential,
@@ -251,6 +266,11 @@ async fn forward(
     .parse::<Uri>() else {
         return Ok(message(StatusCode::BAD_REQUEST, "Invalid request", None));
     };
+    // The core describes its own bearer mode; a Basic workspace must not
+    // publish that as the way to sign in.
+    let describes_auth = matches!(context.credential, Credential::Basic { .. })
+        && request.method() == Method::GET
+        && request.uri().path() == CARD_PATH;
     *request.uri_mut() = target;
     *request.version_mut() = Version::HTTP_11;
     let headers = request.headers_mut();
@@ -267,16 +287,24 @@ async fn forward(
         Ok(upstream) => {
             let (mut parts, body) = upstream.into_parts();
             strip_hop_by_hop(&mut parts.headers);
-            let mut response = Response::new(body.boxed());
+            let body = if describes_auth && parts.status.is_success() {
+                let Ok(card) = Limited::new(body, 1 << 20).collect().await else {
+                    return Ok(message(StatusCode::BAD_GATEWAY, UNREACHABLE, None));
+                };
+                let card = basic_card(card.to_bytes());
+                parts
+                    .headers
+                    .insert(header::CONTENT_LENGTH, card.len().into());
+                Full::new(card).map_err(|e| match e {}).boxed()
+            } else {
+                body.boxed()
+            };
+            let mut response = Response::new(body);
             *response.status_mut() = parts.status;
             *response.headers_mut() = parts.headers;
             response
         }
-        Err(_) => message(
-            StatusCode::BAD_GATEWAY,
-            "Local MCP core is not reachable",
-            None,
-        ),
+        Err(_) => message(StatusCode::BAD_GATEWAY, UNREACHABLE, None),
     })
 }
 
@@ -553,6 +581,21 @@ mod tests {
         client.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 502"), "{response}");
         core.join().unwrap();
+    }
+
+    #[test]
+    fn a_basic_workspace_does_not_publish_the_cores_bearer_mode() {
+        let card = basic_card(Bytes::from_static(
+            br#"{"server":{"name":"x"},"auth":{"type":"bearer","scheme":"Bearer","header":"Authorization"}}"#,
+        ));
+        let card: serde_json::Value = serde_json::from_slice(&card).unwrap();
+        assert_eq!(card["auth"]["type"], "basic");
+        assert_eq!(card["auth"]["scheme"], "Basic");
+        assert_eq!(card["server"]["name"], "x");
+        // Anything that is not a card with a sign-in method passes unchanged.
+        for other in [&b"not json"[..], br#"{"server":{}}"#] {
+            assert_eq!(basic_card(Bytes::copy_from_slice(other)), other);
+        }
     }
 
     #[test]

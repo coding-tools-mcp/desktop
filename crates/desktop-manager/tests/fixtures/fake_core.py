@@ -30,6 +30,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         data = {'server': {'name': 'coding-tools-mcp', 'version': '0.5.0'},
                 'transport': {'endpoint': '/mcp'}}
+        if os.environ.get('CODING_TOOLS_MCP_AUTH_TOKEN'):
+            data['auth'] = {'type': 'bearer', 'scheme': 'Bearer', 'header': 'Authorization'}
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_seen()

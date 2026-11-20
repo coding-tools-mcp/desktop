@@ -473,14 +473,15 @@ fn basic_is_enforced_before_the_core() {
         .send()
         .unwrap();
     assert_eq!(configured.status(), 200);
-    assert_eq!(
-        client
-            .get(format!("http://127.0.0.1:{}/.well-known/mcp.json", w.port))
-            .send()
-            .unwrap()
-            .status(),
-        200
-    );
+    // Public discovery names the method this endpoint accepts, not the core's.
+    let card = client
+        .get(format!("http://127.0.0.1:{}/.well-known/mcp.json", w.port))
+        .send()
+        .unwrap();
+    assert_eq!(card.status(), 200);
+    let card: serde_json::Value = card.json().unwrap();
+    assert_eq!(card["auth"]["scheme"], "Basic");
+    assert_eq!(card["server"]["name"], "coding-tools-mcp");
     assert!(!m.export_diagnostics(&w.id).unwrap().contains(&password));
 
     m.stop(&w.id).unwrap();
