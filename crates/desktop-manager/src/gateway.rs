@@ -3,9 +3,10 @@
 //! The external core only understands `Authorization: Bearer`. For the
 //! `url-token` and `basic` workspace modes the desktop keeps that core on a
 //! private loopback port and answers on the workspace port itself: it checks
-//! the client's credential, then forwards the request with the core's bearer
-//! token. Requests it does not accept are never given that token, so the core
-//! still decides what is public. It is not an MCP server and parses no bodies.
+//! the client's credential, then forwards the request with a bearer token only
+//! this process knows. Requests it does not accept are never given that token,
+//! so the core still decides what is public. It is not an MCP server and parses
+//! no MCP bodies.
 use crate::model::{Secrets, Workspace};
 use base64::Engine;
 use http_body_util::{
