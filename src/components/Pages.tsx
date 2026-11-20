@@ -55,7 +55,14 @@ import { usePageActive } from "../hooks/usePageActive";
 import { SecretInput } from "./SecretInput";
 import { translator, type Translate } from "../i18n";
 import type { RunAction } from "../App";
-import { CallList, Empty, EndpointCard, SectionHead } from "./Common";
+import {
+  CallList,
+  clientEndpoint,
+  Empty,
+  EndpointCard,
+  SectionHead,
+  TOKEN_ENDPOINT_COPIED,
+} from "./Common";
 import { ConfirmModal } from "./WorkspaceModal";
 function configWarning(
   status: Status | undefined,
@@ -175,6 +182,16 @@ export function ConnectionsPage({
       }
     }
   }
+  async function copyEndpoint(endpoint: string) {
+    const result = await run("copy-endpoint", () =>
+      clientEndpoint(workspace, endpoint),
+    );
+    if (result)
+      await onCopy(
+        result,
+        result === endpoint ? undefined : t(TOKEN_ENDPOINT_COPIED),
+      );
+  }
   async function showCredentials() {
     const result = await run("credentials", () =>
       api.authDetails(workspace.id),
@@ -245,7 +262,7 @@ export function ConnectionsPage({
             access={workspace.access}
             isPublic={false}
             t={t}
-            onCopy={onCopy}
+            onCopy={(endpoint) => void copyEndpoint(endpoint)}
             busy={!!busy}
           />
           <Group mt="sm" className="connection-config-actions">
@@ -279,7 +296,7 @@ export function ConnectionsPage({
             access={workspace.access}
             isPublic
             t={t}
-            onCopy={onCopy}
+            onCopy={(endpoint) => void copyEndpoint(endpoint)}
             busy={!!busy}
           />
           <Group mt="sm" className="connection-config-actions">

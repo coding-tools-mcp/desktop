@@ -611,6 +611,45 @@ describe("desktop rendered flows through mocked Tauri invoke", () => {
     });
     expect(saved.secrets).toMatchObject({ basicPassword: "pass-secret" });
   });
+  it("copies a URL-token endpoint that works when pasted on its own", async () => {
+    snapshot.workspaces[0].auth = "url-token";
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command, args) =>
+      command === "auth_details"
+        ? Promise.resolve({ auth: "url-token", urlToken: "TEST+ONLY &x" })
+        : original(command, args),
+    );
+    await dashboard();
+    const endpoint = snapshot.statuses[0].localEndpoint;
+    const expected = `${endpoint}?token=TEST%2BONLY+%26x`;
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Copy endpoint" })[0],
+    );
+    await waitFor(() => expect(clipboard).toHaveBeenLastCalledWith(expected));
+    // The token is copied, never shown.
+    expect(screen.queryByText(/TEST/)).toBeNull();
+    await navigate("Connections");
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Copy endpoint" })[0],
+    );
+    await waitFor(() => expect(clipboard).toHaveBeenCalledTimes(2));
+    expect(clipboard).toHaveBeenLastCalledWith(expected);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Copied with its token. Keep this address private.",
+    );
+  });
+  it("copies other endpoints without asking for credentials", async () => {
+    await dashboard();
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Copy endpoint" })[0],
+    );
+    await waitFor(() =>
+      expect(clipboard).toHaveBeenLastCalledWith(
+        snapshot.statuses[0].localEndpoint,
+      ),
+    );
+    expect(count("auth_details")).toBe(0);
+  });
   it("reveals the credentials that belong to the selected method", async () => {
     snapshot.workspaces[0].auth = "basic";
     const original = invoke.getMockImplementation()!;

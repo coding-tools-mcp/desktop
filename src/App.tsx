@@ -48,10 +48,12 @@ import type { Operation } from "./operations";
 import { translator } from "./i18n";
 import {
   CallList,
+  clientEndpoint,
   EndpointCard,
   formatDuration,
   formatTime,
   StateBadge,
+  TOKEN_ENDPOINT_COPIED,
 } from "./components/Common";
 import { ConfirmModal, WorkspaceModal } from "./components/WorkspaceModal";
 import {
@@ -350,6 +352,17 @@ export default function App() {
   // Capture the workspace at invocation, even when its page is subsequently removed.
   const runWorkspace: RunAction = (key, fn, success) =>
     run(key, fn, success, workspace?.id);
+  async function copyEndpoint(endpoint: string) {
+    if (!workspace) return;
+    const result = await runWorkspace("copy-endpoint", () =>
+      clientEndpoint(workspace, endpoint),
+    );
+    if (result)
+      await copy(
+        result,
+        result === endpoint ? undefined : t(TOKEN_ENDPOINT_COPIED),
+      );
+  }
   async function copy(value: string, success = t("Copied")) {
     const sequence = ++feedbackRequest.current;
     setFeedback(null);
@@ -994,14 +1007,14 @@ export default function App() {
                       access={workspace.access}
                       isPublic={false}
                       t={t}
-                      onCopy={copy}
+                      onCopy={(endpoint) => void copyEndpoint(endpoint)}
                     />
                     <EndpointCard
                       status={status}
                       access={workspace.access}
                       isPublic
                       t={t}
-                      onCopy={copy}
+                      onCopy={(endpoint) => void copyEndpoint(endpoint)}
                       onConfigure={() => navigate("Connections")}
                     />
                   </div>

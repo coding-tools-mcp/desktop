@@ -234,6 +234,9 @@ const zh: Record<string, string> = {
   "Copy endpoint": "复制端点",
   "Copy config": "复制配置",
   Copied: "已复制",
+  "Copied with its token. Keep this address private.":
+    "已复制，地址中包含令牌，请勿公开。",
+  "Credentials are unavailable": "凭据不可用",
   "Operation feedback": "操作反馈",
   "Dismiss notification": "关闭通知",
   "Copy failed": "复制失败",
