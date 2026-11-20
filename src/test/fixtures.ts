@@ -8,6 +8,7 @@ export const fixtureWorkspace: Workspace = {
   access: "local",
   publicUrl: "",
   auth: "noauth",
+  basicUsername: "ctc",
   permissionMode: "safe",
   coreCommand: [],
   coreVersion: "0.9.0-test",

@@ -22,9 +22,24 @@ History displays the core's real structured events, including tool name, timesta
 ## Remote access
 
 - **Local only:** loopback MCP, no public exposure.
-- **Quick Tunnel:** temporary Cloudflare address; changes after a restart. Requires bearer authentication. It is not a stable OAuth endpoint.
+- **Quick Tunnel:** temporary Cloudflare address; changes after a restart. Requires bearer, URL-token or username/password authentication. It is not a stable OAuth endpoint.
 - **Named Tunnel:** a reusable HTTPS hostname. Use an existing tunnel token/hostname, or explicitly authorize `cloudflared tunnel login`, then create a named tunnel and DNS route in the guided UI. The latter requires a domain on your Cloudflare account. The app confirms before creating DNS and never silently replaces another route.
 - **FRP:** reuse an externally managed FRP route. The app does not manage `frpc`.
+
+### Authentication methods
+
+Public access always requires one of these; choose it in the workspace's Access settings.
+
+| Method | What the client sends | Use it when |
+| --- | --- | --- |
+| **Bearer token** (default) | `Authorization: Bearer <token>` | The client can set request headers. |
+| **Token in URL** | `https://…/mcp?token=<token>` | The client only accepts a URL. The whole URL is the secret; the same token is also accepted as a bearer header. |
+| **Username and password** | HTTP Basic (`Authorization: Basic …`); the username defaults to `ctc` | The client offers a username/password sign-in. |
+| **Browser sign-in (OAuth)** | OAuth flow with the workspace password | A fixed public address (Named Tunnel or FRP). |
+
+Empty credential fields are generated on save. **Copy configuration** on the Connections page produces the matching client entry, and **Show credentials** reveals the saved values.
+
+Bearer and OAuth are checked by the core. The core has no URL-token or Basic mode, so for those two the desktop answers on the workspace port itself, checks the credential in constant time, and forwards accepted requests to the core on a private loopback port with a bearer token the client never sees. The `?token=` value is removed before forwarding, so it does not reach core logs. `/.well-known/` discovery stays public, as it is with the core's own modes. The local endpoint uses the same method as the public one.
 
 Packaged builds prefer their bundled Core installer. For developer builds and the other native helpers, discovery first honors PATH, then checks `~/.local/bin` and standard Homebrew directories (`/opt/homebrew/bin` before `/usr/local/bin` in Apple Silicon builds; the reverse in Intel builds). Linux also checks `/usr/local/bin` and `/home/linuxbrew/.linuxbrew/bin`. Only uv, cloudflared and the default core receive these fallbacks. The app never sources shell profiles or workspace configuration to locate them. Explicit relative core executable paths and relative arguments are resolved from the workspace folder.
 

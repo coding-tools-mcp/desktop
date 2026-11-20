@@ -1,5 +1,6 @@
 pub mod core;
 pub mod events;
+pub mod gateway;
 pub mod model;
 pub mod process;
 pub mod runtime;

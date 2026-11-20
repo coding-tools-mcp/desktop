@@ -266,8 +266,15 @@ pub fn client() -> Result<Client> {
 // declared and streamed bodies, including configured public endpoints, before
 // allocating/deserializing arbitrary server output.
 const PROBE_BODY_LIMIT: u64 = 1024 * 1024;
+/// A request error names its URL, and a URL token travels in the query.
+fn without_query(mut error: reqwest::Error) -> reqwest::Error {
+    if let Some(url) = error.url_mut() {
+        url.set_query(None);
+    }
+    error
+}
 fn probe_json(response: reqwest::blocking::Response) -> Result<Value> {
-    let response = response.error_for_status()?;
+    let response = response.error_for_status().map_err(without_query)?;
     if response
         .content_length()
         .is_some_and(|size| size > PROBE_BODY_LIMIT)
@@ -307,11 +314,20 @@ pub fn probe(w: &Workspace, secrets: &Secrets, public: bool) -> Result<String> {
             "Core {version} discovery is reachable; client authentication still needs verification"
         ));
     }
-    let mut request=c.post(format!("{base}/mcp")).header("Accept","application/json, text/event-stream").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"coding-tools-mcp-desktop-health","version":"0.2.0"}}}));
-    if w.auth == "bearer" {
-        request = request.bearer_auth(&secrets.bearer_token);
+    // Probe as a client would: a URL token may hold characters a header cannot carry.
+    let mut endpoint = reqwest::Url::parse(&format!("{base}/mcp"))?;
+    if w.auth == "url-token" {
+        endpoint
+            .query_pairs_mut()
+            .append_pair(crate::gateway::TOKEN_PARAM, &secrets.bearer_token);
     }
-    let response = request.send()?;
+    let mut request=c.post(endpoint).header("Accept","application/json, text/event-stream").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"coding-tools-mcp-desktop-health","version":"0.2.0"}}}));
+    request = match w.auth.as_str() {
+        "bearer" => request.bearer_auth(&secrets.bearer_token),
+        "basic" => request.basic_auth(&w.basic_username, Some(&secrets.basic_password)),
+        _ => request,
+    };
+    let response = request.send().map_err(without_query)?;
     if w.auth == "oauth" && response.status() == 401 {
         return Ok(format!(
             "Core {version} is reachable; OAuth authorization is required"

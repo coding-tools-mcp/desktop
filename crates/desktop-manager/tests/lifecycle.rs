@@ -306,6 +306,323 @@ fn diagnostics_do_not_export_paths_credentials_or_urls() {
     m.stop_all().unwrap();
 }
 
+fn initialize(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::RequestBuilder {
+    client
+        .post(url)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+}
+fn entry(m: &Manager, w: &Workspace) -> serde_json::Value {
+    let config: serde_json::Value =
+        serde_json::from_str(&m.connection_config(&w.id, false).unwrap()).unwrap();
+    config["mcpServers"][&w.name].clone()
+}
+fn challenge(response: &reqwest::blocking::Response) -> &str {
+    response.headers()["www-authenticate"].to_str().unwrap()
+}
+#[test]
+fn url_token_is_enforced_before_the_core_and_never_forwarded() {
+    let (_test_guard, d, m) = manager();
+    let mut w = workspace(d.path());
+    w.auth = "url-token".into();
+    // Saved as typed, including what a bearer header could not carry.
+    let token = " url+tökén/=&x ";
+    let w = m
+        .save_workspace(
+            w,
+            Some(Secrets {
+                bearer_token: token.into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let status = m.start(&w.id).unwrap();
+    assert_eq!(status.local_state, "ready", "{}", status.local_message);
+    let base = format!("http://127.0.0.1:{}", w.port);
+    let client = core::client().unwrap();
+
+    for url in [
+        format!("{base}/mcp"),
+        format!("{base}/mcp?token="),
+        format!("{base}/mcp?token=url%2Bt%C3%B6k%C3%A9n%2F%3D%26x"),
+        format!("{base}/mcp?Token=+url%2Bt%C3%B6k%C3%A9n%2F%3D%26x+"),
+    ] {
+        let denied = initialize(&client, &url).send().unwrap();
+        assert_eq!(denied.status(), 401, "{url}");
+        assert!(challenge(&denied).starts_with("Bearer "));
+        assert!(denied.headers().get("x-fixture-target").is_none());
+    }
+    assert_eq!(
+        client.get(format!("{base}/mcp")).send().unwrap().status(),
+        401
+    );
+    let basic = initialize(&client, &format!("{base}/mcp"))
+        .basic_auth("ctc", Some(token))
+        .send()
+        .unwrap();
+    assert_eq!(basic.status(), 401);
+
+    let entry = entry(&m, &w);
+    let url = entry["url"].as_str().unwrap();
+    assert_eq!(
+        url,
+        format!("{base}/mcp?token=+url%2Bt%C3%B6k%C3%A9n%2F%3D%26x+")
+    );
+    assert!(entry["headers"].is_null());
+    let accepted = initialize(&client, url).send().unwrap();
+    assert_eq!(accepted.status(), 200);
+    assert_eq!(accepted.headers()["x-fixture-target"], "/mcp");
+    let mixed = initialize(&client, &format!("{url}&cursor=a%20b"))
+        .send()
+        .unwrap();
+    assert_eq!(mixed.headers()["x-fixture-target"], "/mcp?cursor=a%20b");
+
+    // Discovery stays public, and is forwarded without the core's credential.
+    let discovery = client
+        .get(format!("{base}/.well-known/mcp.json"))
+        .send()
+        .unwrap();
+    assert_eq!(discovery.status(), 200);
+    assert_eq!(discovery.headers()["x-fixture-credential"], "0");
+    let spoofed = client
+        .get(format!("{base}/.well-known/mcp.json"))
+        .bearer_auth("guess")
+        .send()
+        .unwrap();
+    assert_eq!(spoofed.headers()["x-fixture-credential"], "0");
+
+    assert_eq!(m.auth_details(&w.id).unwrap()["urlToken"], token);
+    assert_eq!(m.restart(&w.id).unwrap().local_state, "ready");
+    assert_eq!(initialize(&client, url).send().unwrap().status(), 200);
+    m.stop_all().unwrap();
+    assert!(TcpListener::bind(("127.0.0.1", w.port)).is_ok());
+}
+#[test]
+fn basic_is_enforced_before_the_core() {
+    let (_test_guard, d, m) = manager();
+    let mut w = workspace(d.path());
+    // The bearer token was handed to clients before the switch to Basic.
+    w.auth = "bearer".into();
+    let shared = "token-shared-before-the-switch";
+    let secrets = Secrets {
+        bearer_token: shared.into(),
+        ..Default::default()
+    };
+    let mut w = m.save_workspace(w, Some(secrets)).unwrap();
+    w.auth = "basic".into();
+    w.basic_username = "  ".into();
+    let w = m.save_workspace(w, None).unwrap();
+    assert_eq!(w.basic_username, "ctc");
+    let details = m.auth_details(&w.id).unwrap();
+    assert_eq!(details["basicUsername"], "ctc");
+    let password = details["basicPassword"].as_str().unwrap().to_owned();
+    assert!(password.len() >= 32);
+
+    let status = m.start(&w.id).unwrap();
+    assert_eq!(status.local_state, "ready", "{}", status.local_message);
+    let url = format!("http://127.0.0.1:{}/mcp", w.port);
+    let client = core::client().unwrap();
+    let attempts: [(&str, Option<&str>); 4] = [
+        ("ctc", Some("wrong")),
+        ("other", Some(&password)),
+        ("ctc", None),
+        ("", Some(&password)),
+    ];
+    for (user, pass) in attempts {
+        let denied = initialize(&client, &url)
+            .basic_auth(user, pass)
+            .send()
+            .unwrap();
+        assert_eq!(denied.status(), 401, "{user}");
+        assert!(challenge(&denied).starts_with("Basic "));
+    }
+    let anonymous = initialize(&client, &url).send().unwrap();
+    assert!(challenge(&anonymous).starts_with("Basic "));
+    assert!(anonymous
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+    // A page the core allows must be able to read the refusal and ask again.
+    let page = "http://localhost:6274";
+    let browser = initialize(&client, &url)
+        .header("Origin", page)
+        .send()
+        .unwrap();
+    assert_eq!(browser.status(), 401);
+    assert!(challenge(&browser).starts_with("Basic "));
+    assert_eq!(browser.headers()["access-control-allow-origin"], page);
+    assert_eq!(browser.headers()["vary"], "Origin");
+    let foreign = initialize(&client, &url)
+        .header("Origin", "https://elsewhere.example")
+        .send()
+        .unwrap();
+    assert_eq!(foreign.status(), 401);
+    assert!(foreign
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+    // The core's own token is not a way around the password.
+    let bearer = initialize(&client, &url)
+        .bearer_auth(&password)
+        .send()
+        .unwrap();
+    assert_eq!(bearer.status(), 401);
+    let query = initialize(&client, &format!("{url}?token={password}"))
+        .send()
+        .unwrap();
+    assert_eq!(query.status(), 401);
+
+    let accepted = initialize(&client, &url)
+        .basic_auth("ctc", Some(&password))
+        .send()
+        .unwrap();
+    assert_eq!(accepted.status(), 200);
+    // Neither that old token nor the password opens the core's own port.
+    let core_port = accepted.headers()["x-fixture-port"].to_str().unwrap();
+    assert_ne!(core_port, w.port.to_string());
+    for stale in [shared, password.as_str()] {
+        let direct = initialize(&client, &format!("http://127.0.0.1:{core_port}/mcp"))
+            .bearer_auth(stale)
+            .send()
+            .unwrap();
+        assert_eq!(direct.status(), 401);
+    }
+    let entry = entry(&m, &w);
+    assert_eq!(entry["url"], url);
+    let configured = initialize(&client, &url)
+        .header(
+            "Authorization",
+            entry["headers"]["Authorization"].as_str().unwrap(),
+        )
+        .send()
+        .unwrap();
+    assert_eq!(configured.status(), 200);
+    // Public discovery names the method this endpoint accepts, not the core's.
+    let card = client
+        .get(format!("http://127.0.0.1:{}/.well-known/mcp.json", w.port))
+        .send()
+        .unwrap();
+    assert_eq!(card.status(), 200);
+    let card: serde_json::Value = card.json().unwrap();
+    assert_eq!(card["auth"]["scheme"], "Basic");
+    assert_eq!(card["server"]["name"], "coding-tools-mcp");
+    assert!(!m.export_diagnostics(&w.id).unwrap().contains(&password));
+
+    m.stop(&w.id).unwrap();
+    let mut edited = w.clone();
+    edited.basic_username = "team:one".into();
+    assert!(m.save_workspace(edited.clone(), None).is_err());
+    edited.basic_username = "team".into();
+    let custom = "pä:ss wörd";
+    let w = m
+        .save_workspace(
+            edited,
+            Some(Secrets {
+                basic_password: custom.into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    m.start(&w.id).unwrap();
+    let old = initialize(&client, &url)
+        .basic_auth("ctc", Some(&password))
+        .send()
+        .unwrap();
+    assert_eq!(old.status(), 401);
+    let new = initialize(&client, &url)
+        .basic_auth("team", Some(custom))
+        .send()
+        .unwrap();
+    assert_eq!(new.status(), 200);
+    m.stop_all().unwrap();
+}
+#[test]
+fn gateway_port_is_released_when_the_core_crashes_or_fails_to_start() {
+    let (_test_guard, d, m) = manager();
+    let mut w = workspace(d.path());
+    w.auth = "basic".into();
+    let w = m.save_workspace(w, None).unwrap();
+    let status = m.start(&w.id).unwrap();
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+    assert!(sys
+        .process(sysinfo::Pid::from_u32(status.pid.unwrap()))
+        .unwrap()
+        .kill());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        m.refresh();
+        let status = m.snapshot().statuses.remove(0);
+        if status.state == "error" && !status.cleanup_pending {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Crash was not observed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(TcpListener::bind(("127.0.0.1", w.port)).is_ok());
+    assert_eq!(m.start(&w.id).unwrap().state, "running");
+    m.stop_all().unwrap();
+
+    let mut broken = w.clone();
+    broken.core_command = vec![python(), "-c".into(), "raise SystemExit(3)".into()];
+    let w = m.save_workspace(broken, None).unwrap();
+    assert!(m.start(&w.id).is_err());
+    assert!(TcpListener::bind(("127.0.0.1", w.port)).is_ok());
+}
+#[test]
+fn profiles_saved_before_the_new_methods_keep_bearer_behaviour() {
+    let old: Workspace = serde_json::from_value(
+        json!({"id":"a","name":"Old","path":"/tmp","port":1,"access":"quick","auth":"bearer"}),
+    )
+    .unwrap();
+    assert_eq!(
+        (old.auth.as_str(), old.basic_username.as_str()),
+        ("bearer", "ctc")
+    );
+    let secrets: Secrets = serde_json::from_value(json!({"bearerToken":"kept"})).unwrap();
+    assert!(secrets.basic_password.is_empty());
+
+    let (_test_guard, d, m) = manager();
+    let mut w = workspace(d.path());
+    w.auth = "bearer".into();
+    let w = m
+        .save_workspace(
+            w,
+            Some(Secrets {
+                bearer_token: "kept".into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    m.start(&w.id).unwrap();
+    let url = format!("http://127.0.0.1:{}/mcp", w.port);
+    let entry = entry(&m, &w);
+    assert_eq!(entry["url"], url);
+    assert_eq!(entry["headers"]["Authorization"], "Bearer kept");
+    let client = core::client().unwrap();
+    // No gateway: the token in a URL means nothing to the core.
+    let query = initialize(&client, &format!("{url}?token=kept"))
+        .send()
+        .unwrap();
+    assert_eq!(query.status(), 401);
+    let header = initialize(&client, &url)
+        .bearer_auth("kept")
+        .send()
+        .unwrap();
+    assert_eq!(header.status(), 200);
+    m.stop_all().unwrap();
+
+    // Quick Tunnel now accepts the header-free methods; OAuth still needs a fixed address.
+    for (auth, allowed) in [("url-token", true), ("basic", true), ("oauth", false)] {
+        let mut quick = w.clone();
+        quick.access = "quick".into();
+        quick.auth = auth.into();
+        assert_eq!(m.save_workspace(quick, None).is_ok(), allowed, "{auth}");
+    }
+}
+
 // Run explicitly against an installed, unmodified official core, never import its internals.
 #[test]
 #[ignore = "Set DESKTOP_CORE_COMMAND_JSON to the official external core command"]
@@ -460,6 +777,86 @@ fn official_core_mcp_acceptance() {
     m.stop_all().unwrap();
     assert!(TcpListener::bind(("127.0.0.1", w.port)).is_ok());
     eprintln!("[core acceptance] assertions complete");
+}
+
+// The gateway-enforced methods against the same unmodified official core.
+#[test]
+#[ignore = "Set DESKTOP_CORE_COMMAND_JSON to the official external core command"]
+fn official_core_mcp_acceptance_behind_the_gateway() {
+    let command: Vec<String> = serde_json::from_str(
+        &std::env::var("DESKTOP_CORE_COMMAND_JSON").expect("set DESKTOP_CORE_COMMAND_JSON"),
+    )
+    .unwrap();
+    let (_test_guard, d, m) = manager();
+    let project = d.path().join("gateway project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("hello.txt"), "gateway acceptance\n").unwrap();
+    let c = core::client().unwrap();
+    for auth in ["url-token", "basic"] {
+        eprintln!("[core acceptance] {auth}: start core behind the gateway");
+        let mut w = workspace(&project);
+        w.name = auth.into();
+        w.auth = auth.into();
+        w.core_command = command.clone();
+        let w = m.save_workspace(w, None).unwrap();
+        let status = m.start(&w.id).unwrap();
+        assert_eq!(status.local_state, "ready", "{}", status.local_message);
+        let base = format!("http://127.0.0.1:{}", w.port);
+        let rpc = |url: &str, authorization: Option<&str>, method: &str, params| {
+            let mut request = c
+                .post(url)
+                .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}));
+            if let Some(value) = authorization {
+                request = request.header("Authorization", value);
+            }
+            request.send().unwrap()
+        };
+        let init = json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"desktop-gateway-acceptance","version":"1"}});
+        assert_eq!(
+            rpc(&format!("{base}/mcp"), None, "initialize", init.clone()).status(),
+            401
+        );
+        let card = c
+            .get(format!("{base}/.well-known/mcp.json"))
+            .send()
+            .unwrap();
+        assert!(card.status().is_success());
+        let card: serde_json::Value = card.json().unwrap();
+        let scheme = if auth == "basic" { "Basic" } else { "Bearer" };
+        assert_eq!(card["auth"]["scheme"], scheme);
+        // The core lets loopback pages read responses; a refusal is one too.
+        let page = "http://localhost:6274";
+        let refused = c
+            .post(format!("{base}/mcp"))
+            .header("Origin", page)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init}))
+            .send()
+            .unwrap();
+        assert_eq!(refused.status(), 401);
+        assert_eq!(refused.headers()["access-control-allow-origin"], page);
+        // Connect exactly as the copied client configuration says to.
+        let entry = entry(&m, &w);
+        let url = entry["url"].as_str().unwrap();
+        let authorization = entry["headers"]["Authorization"].as_str();
+        assert_eq!(authorization.is_some(), auth == "basic");
+        let response = rpc(url, authorization, "initialize", init);
+        assert!(response.status().is_success(), "{}", response.status());
+        let payload: serde_json::Value = response.json().unwrap();
+        assert_eq!(payload["result"]["serverInfo"]["name"], "coding-tools-mcp");
+        let read = rpc(
+            url,
+            authorization,
+            "tools/call",
+            json!({"name":"read_file","arguments":{"path":"hello.txt"}}),
+        );
+        assert!(read.status().is_success(), "{}", read.status());
+        assert!(read.text().unwrap().contains("gateway acceptance"));
+        m.stop(&w.id).unwrap();
+        assert!(TcpListener::bind(("127.0.0.1", w.port)).is_ok());
+    }
+    eprintln!("[core acceptance] gateway assertions complete");
 }
 
 #[test]

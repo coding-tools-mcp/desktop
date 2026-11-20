@@ -568,6 +568,118 @@ describe("desktop rendered flows through mocked Tauri invoke", () => {
       screen.getByText(/You can still connect and use it/),
     ).toBeInTheDocument();
   });
+  it("offers header-free authentication for a temporary tunnel and saves the choice", async () => {
+    await onboarding();
+    const pick = async (field: string, option: string) => {
+      await userEvent.click(screen.getByRole("textbox", { name: field }));
+      await userEvent.click(screen.getByRole("option", { name: option }));
+    };
+    await pick("Access", "Temporary sharing");
+    expect(screen.getByRole("textbox", { name: "Authentication" })).toHaveValue(
+      "Bearer token",
+    );
+    await userEvent.click(
+      screen.getByRole("textbox", { name: "Authentication" }),
+    );
+    expect(
+      screen.queryByRole("option", { name: "Browser sign-in (OAuth)" }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("option", { name: "Token in URL" }));
+    await userEvent.type(screen.getByLabelText("URL token"), "url-secret");
+    await pick("Authentication", "Username and password");
+    expect(screen.getByLabelText("Username")).toHaveValue("ctc");
+    await userEvent.type(screen.getByLabelText("Username"), ":");
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(
+      screen.getByText("Username cannot contain a colon."),
+    ).toBeInTheDocument();
+    await userEvent.clear(screen.getByLabelText("Username"));
+    await userEvent.type(screen.getByLabelText("Username"), "team");
+    await userEvent.type(screen.getByLabelText("Password"), "pass-secret");
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Create workspace" }),
+    );
+    await waitFor(() => expect(count("save_workspace")).toBe(1));
+    const saved = invoke.mock.calls.find(
+      ([name]) => name === "save_workspace",
+    )?.[1];
+    expect(saved.workspace).toMatchObject({
+      access: "quick",
+      auth: "basic",
+      basicUsername: "team",
+    });
+    expect(saved.secrets).toMatchObject({ basicPassword: "pass-secret" });
+  });
+  it("copies a URL-token endpoint that works when pasted on its own", async () => {
+    snapshot.workspaces[0].auth = "url-token";
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command, args) =>
+      command === "auth_details"
+        ? Promise.resolve({ auth: "url-token", urlToken: "TEST+ONLY &x" })
+        : original(command, args),
+    );
+    await dashboard();
+    const endpoint = snapshot.statuses[0].localEndpoint;
+    const expected = `${endpoint}?token=TEST%2BONLY+%26x`;
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Copy endpoint" })[0],
+    );
+    await waitFor(() => expect(clipboard).toHaveBeenLastCalledWith(expected));
+    // The token is copied, never shown.
+    expect(screen.queryByText(/TEST/)).toBeNull();
+    await navigate("Connections");
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Copy endpoint" })[0],
+    );
+    await waitFor(() => expect(clipboard).toHaveBeenCalledTimes(2));
+    expect(clipboard).toHaveBeenLastCalledWith(expected);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Copied with its token. Keep this address private.",
+    );
+  });
+  it("copies other endpoints within the click, with no lookup", async () => {
+    await dashboard();
+    for (const page of ["Dashboard", "Connections"]) {
+      if (page !== "Dashboard") await navigate(page);
+      clipboard.mockClear();
+      // The clipboard may only be written during the click itself.
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "Copy endpoint" })[0],
+      );
+      expect(clipboard).toHaveBeenCalledWith(
+        snapshot.statuses[0].localEndpoint,
+      );
+    }
+    expect(count("auth_details")).toBe(0);
+  });
+  it("reveals the credentials that belong to the selected method", async () => {
+    snapshot.workspaces[0].auth = "basic";
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command, args) =>
+      command === "auth_details"
+        ? Promise.resolve({
+            auth: "basic",
+            basicUsername: "team",
+            basicPassword: "TEST-ONLY-NONSECRET",
+          })
+        : original(command, args),
+    );
+    await dashboard();
+    await navigate("Connections");
+    expect(screen.getByText("Username and password")).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Show credentials" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Show credentials",
+    });
+    expect(within(dialog).getByLabelText("Username")).toHaveValue("team");
+    expect(within(dialog).getByLabelText("Password")).toHaveValue(
+      "TEST-ONLY-NONSECRET",
+    );
+    expect(within(dialog).queryByLabelText("Bearer token")).toBeNull();
+  });
   it("preserves literal executable arguments without shell splitting", async () => {
     snapshot = fixtureSnapshot({ stopped: true });
     await dashboard();

@@ -9,7 +9,8 @@ import {
   Radio,
 } from "lucide-react";
 import type { ReactNode } from "react";
-import type { Activity, Status } from "../types";
+import { api } from "../api";
+import type { Activity, Status, Workspace } from "../types";
 import { activityOutcome } from "../types";
 import type { Translate } from "../i18n";
 export function StateBadge({ state, t }: { state?: string; t: Translate }) {
@@ -212,6 +213,14 @@ export function CallList({
     </div>
   );
 }
+/** The address a URL-token client can paste as is: the endpoint with its token. */
+export async function tokenEndpoint(workspace: Workspace, endpoint: string) {
+  const { urlToken } = await api.authDetails(workspace.id);
+  if (!urlToken) throw new Error("Credentials are unavailable");
+  return `${endpoint}?${new URLSearchParams({ token: urlToken })}`;
+}
+export const TOKEN_ENDPOINT_COPIED =
+  "Copied with its token. Keep this address private.";
 export function EndpointCard({
   isPublic,
   status,

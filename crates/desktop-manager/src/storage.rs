@@ -429,6 +429,7 @@ impl Storage {
                 } else {
                     text("/auth/type")
                 },
+                basic_username: crate::gateway::DEFAULT_USERNAME.into(),
                 permission_mode: if text("/runtime/permission_mode").is_empty() {
                     "trusted".into()
                 } else {

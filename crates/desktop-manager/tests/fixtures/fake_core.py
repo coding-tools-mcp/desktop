@@ -21,13 +21,36 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def send_seen(self):
+        # Lets gateway tests assert what was actually forwarded to the core.
+        self.send_header('X-Fixture-Target', self.path)
+        self.send_header('X-Fixture-Credential', '1' if self.headers.get('Authorization') else '0')
+        self.send_header('X-Fixture-Port', str(self.server.server_address[1]))
+
     def do_GET(self):
         data = {'server': {'name': 'coding-tools-mcp', 'version': '0.5.0'},
                 'transport': {'endpoint': '/mcp'}}
+        if os.environ.get('CODING_TOOLS_MCP_AUTH_TOKEN'):
+            data['auth'] = {'type': 'bearer', 'scheme': 'Bearer', 'header': 'Authorization'}
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
+        self.send_seen()
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
+
+    def do_OPTIONS(self):
+        # Like the core: loopback pages may read responses, other origins may not.
+        origin = self.headers.get('Origin', '')
+        if origin and not origin.startswith('http://localhost'):
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(204)
+        if origin:
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Vary', 'Origin')
+            self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+        self.end_headers()
 
     def do_POST(self):
         if args.oauth_mode:
@@ -42,6 +65,7 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get('Content-Length', 0)))
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
+        self.send_seen()
         self.end_headers()
         self.wfile.write(b'{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"coding-tools-mcp","version":"0.5.0"}}}')
 
