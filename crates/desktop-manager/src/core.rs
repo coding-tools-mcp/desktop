@@ -441,6 +441,84 @@ fn installer_command(uv: &Path, home: &Path, bundled: bool) -> Result<Command> {
     Ok(command)
 }
 
+/// Oldest published Core this desktop can start and verify.
+pub const MIN_CORE_VERSION: &str = "0.5.0";
+
+fn release(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|part| {
+            let digits = part
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(part.len());
+            part[..digits].parse().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Remove environments left by an interrupted installation. A completed
+/// install keeps its directory name and may be the only copy of a working
+/// Core (for example after starting fresh), so remove only directories that
+/// never received the Core executable and that nothing refers to.
+pub(crate) fn remove_stale_installs(home: &Path, config: &Config) {
+    let pattern = regex::Regex::new(r"^\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?-[A-Za-z0-9]{6}$").unwrap();
+    let used: Vec<&String> = config
+        .managed_core
+        .iter()
+        .chain(&config.previous_core)
+        .chain(
+            config
+                .workspaces
+                .iter()
+                .filter_map(|w| w.core_command.first()),
+        )
+        .collect();
+    for entry in std::fs::read_dir(home.join("cores"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && pattern.is_match(&entry.file_name().to_string_lossy())
+            && !["bin/coding-tools-mcp", "Scripts/coding-tools-mcp.exe"]
+                .iter()
+                .any(|executable| path.join(executable).is_file())
+            && !used.iter().any(|core| Path::new(core).starts_with(&path))
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// The newest complete managed install that still reports its own version.
+/// Used when the configuration no longer names one, such as after starting
+/// fresh, so a working Core does not have to be downloaded again.
+pub(crate) fn installed_core(home: &Path) -> Option<String> {
+    let mut found: Vec<_> = std::fs::read_dir(home.join("cores"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version = name.rsplit_once('-')?.0.to_owned();
+            let executable = ["bin/coding-tools-mcp", "Scripts/coding-tools-mcp.exe"]
+                .iter()
+                .map(|file| entry.path().join(file))
+                .find(|path| is_executable_file(path))?;
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            (release(&version) >= release(MIN_CORE_VERSION))
+                .then_some((modified, version, executable))
+        })
+        .collect();
+    found.sort_by_key(|found| std::cmp::Reverse(found.0));
+    found.into_iter().find_map(|(_, version, executable)| {
+        let executable = executable.to_string_lossy().into_owned();
+        let output = managed_version_output(std::slice::from_ref(&executable), home).ok()?;
+        (reported_version(&output) == Some(&version)).then_some(executable)
+    })
+}
+
 pub(crate) fn install_with_bundled_uv(
     storage: &Storage,
     version: &str,
@@ -451,6 +529,9 @@ pub(crate) fn install_with_bundled_uv(
         .is_match(version)
     {
         bail!("Enter an exact published version such as 0.5.0");
+    }
+    if release(version) < release(MIN_CORE_VERSION) {
+        bail!("Core version is too old: {version}\nThe minimum supported Core version is {MIN_CORE_VERSION}.");
     }
     let uv = if let Some(path) = bundled_uv {
         if !path.is_absolute() || !is_executable_file(path) {
@@ -529,8 +610,23 @@ pub(crate) fn install_with_bundled_uv(
             });
         }
         if !success {
+            // Report the installer's own reason, not only where to find it.
+            let output = crate::events::logs(&log, 0, &Secrets::default())
+                .map(|logs| logs.text)
+                .unwrap_or_default();
+            if output.contains(&format!("no version of coding-tools-mcp=={version}"))
+                || output.contains("No matching distribution")
+            {
+                bail!("Core version not found: {version}\nCheck the version number; previous core remains selected.");
+            }
+            let reason: Vec<&str> = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
             bail!(
-                "Installation failed; previous core remains selected. See core-install.log.\n{}",
+                "Installation failed; previous core remains selected. See core-install.log.\n{}\n{}",
+                reason[reason.len().saturating_sub(6)..].join("\n"),
                 log.display()
             );
         }

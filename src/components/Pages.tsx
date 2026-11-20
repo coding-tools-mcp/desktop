@@ -53,7 +53,7 @@ import {
 import { useSavedDraft } from "../hooks/useSavedDraft";
 import { usePageActive } from "../hooks/usePageActive";
 import { SecretInput } from "./SecretInput";
-import type { Translate } from "../i18n";
+import { translator, type Translate } from "../i18n";
 import type { RunAction } from "../App";
 import { CallList, Empty, EndpointCard, SectionHead } from "./Common";
 import { ConfirmModal } from "./WorkspaceModal";
@@ -1021,7 +1021,8 @@ export function SettingsPage({
         onSettingsSaved(saved);
         return saved;
       },
-      t("Saved"),
+      // Confirm in the language that was just saved, not the previous one.
+      translator(draft.language)("Saved"),
     );
     if (pageActive.current && result) setDraft(result);
   }

@@ -328,7 +328,7 @@ export default function App() {
         // before reporting failure. Reconcile even on rejection.
         if (shouldRefresh) void refresh(true);
         const action = {
-          install: "Install version",
+          install: "Core installation",
           rollback: "Roll back",
           "cloudflare-login": "Authorize Cloudflare",
           "tunnel-setup": "Create tunnel and DNS",

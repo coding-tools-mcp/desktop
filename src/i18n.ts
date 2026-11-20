@@ -57,7 +57,7 @@ const zh: Record<string, string> = {
   "Enter an exact published version such as 0.5.0":
     "请输入准确的已发布版本号，例如 0.5.0。",
   "Installation failed; previous core remains selected. See core-install.log.":
-    "安装失败，仍保留之前选择的核心。请检查网络连接，并查看 core-install.log。",
+    "安装失败，仍保留之前选择的核心。原因见下方，完整输出见 core-install.log。",
   "Installation timed out; previous core remains selected. See core-install.log.":
     "安装超时，仍保留之前选择的核心。请检查网络连接，并查看 core-install.log。",
   "New core failed verification; previous core remains selected":
@@ -140,8 +140,6 @@ const zh: Record<string, string> = {
     "日志已截断或重新开始，正在显示最新可用片段。",
   "After restarting or upgrading the core, reconnect your MCP client. If authorization fails, remove this server's saved authorization in the client and sign in again using the password from Show credentials.":
     "重启或升级核心后，请重新连接 MCP 客户端。如果授权失败，请移除该服务器在客户端中的已保存授权，并使用“显示凭据”中的密码重新登录。",
-  "Tool-call history requires a core with event-journal support. You can configure one in Settings.":
-    "工具调用历史需要支持事件日志的核心，可以在设置中配置。",
   "Tool history unavailable": "工具调用历史不可用",
   "This core build does not expose tool-call history. Install an event-capable official core and select its executable in Settings. No calls are fabricated.":
     "此核心版本不提供工具调用历史。请安装支持事件日志的官方核心，并在设置中选择其可执行文件。应用不会生成虚假调用数据。",
@@ -444,7 +442,81 @@ const zh: Record<string, string> = {
     "请输入准确版本号，例如 0.5.0。",
   "Created successfully. Start failed; your workspace is saved and can be retried.":
     "已创建并保存，但启动失败。你可以重试启动。",
+  "Connect an MCP client and run tools as usual. This Core does not record calls, so none will appear here.":
+    "可以照常连接 MCP 客户端并使用工具。此版本的核心不记录调用，因此这里不会显示记录。",
+  "Core installation": "核心安装",
+  "Core version not found": "未找到该核心版本：",
+  "Check the version number; previous core remains selected.":
+    "请检查版本号；仍保留之前选择的核心。",
+  "Core version is too old": "核心版本过旧：",
+  "The minimum supported Core version is 0.5.0.":
+    "支持的最低核心版本为 0.5.0。",
+  "Core process exit code": "核心进程退出码：",
+  "Python core exited unexpectedly. Inspect logs and restart.":
+    "核心意外退出，请查看日志并重新启动。",
+  "Python core exited; cleanup is not confirmed. Retry Stop before editing or deleting.":
+    "核心已退出，但清理尚未确认。请先重试停止，再编辑或删除。",
+  "Startup cleanup is not confirmed. Retry Stop before editing or deleting":
+    "启动清理尚未确认。请先重试停止，再编辑或删除：",
+  "Waiting for MCP readiness": "正在等待 MCP 就绪",
+  "Waiting for the Python core to finish starting. macOS hostname lookup can take about 30 seconds; readiness is still being checked.":
+    "正在等待核心完成启动。macOS 主机名查询可能需要约 30 秒，仍在检查就绪状态。",
+  "Reading real calls from this core's private event journal":
+    "正在从此核心的私有事件日志读取真实调用",
+  "Tunnel cleanup is not confirmed. Retry Stop before editing or deleting.":
+    "隧道清理尚未确认。请先重试停止，再编辑或删除。",
+  "Cloudflare cleanup is not confirmed. Retry Stop before editing or deleting.":
+    "Cloudflare 清理尚未确认。请先重试停止，再编辑或删除。",
+  "Local MCP exited; public access is unavailable":
+    "本地 MCP 已退出，公网访问不可用",
+  "Could not stop the previous tunnel; replacement was not started":
+    "无法停止之前的隧道，未启动新的隧道：",
+  "Connecting Cloudflare; local MCP is ready":
+    "正在连接 Cloudflare；本地 MCP 已就绪",
+  "Temporary tunnel connected. Address changes when restarted.":
+    "临时隧道已连接。重启后地址会变化。",
+  "Fixed tunnel connected. Run diagnostics to verify the public route.":
+    "固定隧道已连接。运行诊断以验证公网线路。",
+  "Cloudflare process exited. Local MCP is still available; retry public access.":
+    "Cloudflare 进程已退出。本地 MCP 仍可用，请重试公网访问。",
+  "Cloudflare process exited. See tunnel logs; local MCP remains available.":
+    "Cloudflare 进程已退出。请查看隧道日志；本地 MCP 仍可用。",
+  "Cloudflare exited but cleanup is not confirmed. Retry Stop or public access":
+    "Cloudflare 已退出，但清理尚未确认。请重试停止或公网访问：",
+  "Cloudflare did not establish a connection within 25 seconds. Local MCP remains available; retry public access.":
+    "Cloudflare 未在 25 秒内建立连接。本地 MCP 仍可用，请重试公网访问。",
+  "Workspace operation is in progress; wait for startup to finish":
+    "工作区操作正在进行，请等待启动完成",
+  "Desktop is shutting down; no new operations can start":
+    "桌面应用正在关闭，无法开始新的操作",
+  "Endpoint is reachable but is not a Coding Tools MCP server":
+    "端点可达，但不是 Coding Tools MCP 服务器",
+  "MCP initialize did not return the expected server identity":
+    "MCP 初始化未返回预期的服务器标识",
+  "Workspace folder": "工作区文件夹",
+  "Folder exists": "文件夹存在",
+  "Folder no longer exists": "文件夹已不存在",
+  "Core executable": "核心可执行文件",
+  "Local MCP protocol": "本地 MCP 协议",
+  "Public discovery": "公网探测",
+  "Tool activity": "工具活动",
 };
+// Backend lines that embed a value in the middle of the sentence.
+const zhPatterns: [RegExp, string][] = [
+  [/^Core (\S+): MCP initialize succeeded$/, "核心 $1：MCP 初始化成功"],
+  [
+    /^Core (\S+) is reachable; OAuth authorization is required$/,
+    "核心 $1 可达；需要 OAuth 授权",
+  ],
+  [
+    /^Core (\S+) discovery is reachable; client authentication still needs verification$/,
+    "核心 $1 探测可达；客户端认证仍需验证",
+  ],
+  [
+    /^(\d+) recent tool calls read from the core event journal$/,
+    "已从核心事件日志读取最近 $1 次工具调用",
+  ],
+];
 export const translator = (language: Language) => (text: string) => {
   if (language !== "zh") return text;
   if (zh[text]) return zh[text];
@@ -454,6 +526,8 @@ export const translator = (language: Language) => (text: string) => {
     .split("\n")
     .map((line) => {
       if (zh[line]) return zh[line];
+      for (const [pattern, replacement] of zhPatterns)
+        if (pattern.test(line)) return line.replace(pattern, replacement);
       const separator = line.indexOf(": ");
       const summary = line.slice(0, separator);
       return separator >= 0 && zh[summary]

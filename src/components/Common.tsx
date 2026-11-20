@@ -130,7 +130,7 @@ export function CallList({
         )}
         detail={t(
           unavailable
-            ? "Tool-call history requires a core with event-journal support. You can configure one in Settings."
+            ? "Connect an MCP client and run tools as usual. This Core does not record calls, so none will appear here."
             : "Connect an MCP client and run a tool. Real calls will appear here automatically.",
         )}
       />

@@ -113,7 +113,8 @@ fn run(mut command: std::process::Command) -> anyhow::Result<i32> {
     while process.alive() && !stopping.load(Ordering::Relaxed) && parent_alive(50)? {
         if Instant::now() >= next_observation {
             process.metrics();
-            next_observation = Instant::now() + Duration::from_millis(250);
+            // Observation only seeds cleanup identities; stop() rescans first.
+            next_observation = Instant::now() + Duration::from_secs(1);
         }
     }
     let exit_code = process.exit_code().unwrap_or(0);
