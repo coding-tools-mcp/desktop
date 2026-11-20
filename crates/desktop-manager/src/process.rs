@@ -57,6 +57,21 @@ fn linux_descendants(root: u32) -> Vec<u32> {
     found
 }
 
+/// Kernel start time in clock ticks, read straight from procfs. A recycled
+/// PID always differs; a dead or unreadable one reports as gone, so cleanup
+/// can never signal a stranger that inherited the PID after the cached
+/// sysinfo entry went stale.
+#[cfg(target_os = "linux")]
+fn linux_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 /// Construct the command before applying argv, environment (including
 /// env_clear), or current_dir, so wrapping never reconstructs those settings.
 /// The supervisor executable must be an absolute path to this native binary.
@@ -344,6 +359,11 @@ impl ManagedProcess {
                     && p.parent().map(|p| p.as_u32()) == Some(pid)
                     && !seen.iter().any(|(x, _)| *x == id.as_u32())
                 {
+                    #[cfg(target_os = "linux")]
+                    if let Some(start) = linux_start_time(id.as_u32()) {
+                        seen.push((id.as_u32(), start));
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     seen.push((id.as_u32(), p.start_time()));
                     parents.push(id.as_u32());
                 }
@@ -356,11 +376,9 @@ impl ManagedProcess {
         }
         // Keep previously observed children even after reparenting, but drop
         // dead/reused identities to bound the tracking set.
-        self.descendants.retain(|(pid, start)| {
-            self.system
-                .process(Pid::from_u32(*pid))
-                .is_some_and(|p| p.start_time() == *start)
-        });
+        let system = &self.system;
+        self.descendants
+            .retain(|(pid, start)| Self::identity_matches(system, *pid, *start));
         // A supervisor contributes no application work, but direct launches
         // (including Windows) must include both the core and its workers.
         let own = if self.supervised {
@@ -378,8 +396,16 @@ impl ManagedProcess {
                 (cpu + p.cpu_usage(), memory.saturating_add(p.memory()))
             })
     }
-    fn identity_matches(&self, pid: u32, start: u64) -> bool {
-        self.system
+    fn identity_matches(system: &System, pid: u32, start: u64) -> bool {
+        // Linux re-verifies against procfs instead of the cached table: a
+        // stale entry could outlive its process and bless a recycled PID.
+        #[cfg(target_os = "linux")]
+        {
+            let _ = system;
+            linux_start_time(pid) == Some(start)
+        }
+        #[cfg(not(target_os = "linux"))]
+        system
             .process(Pid::from_u32(pid))
             .map(|p| p.start_time() == start)
             .unwrap_or(false)
@@ -418,7 +444,7 @@ impl ManagedProcess {
                     }
                 }
                 for (pid, start) in self.descendants.iter().rev() {
-                    if self.identity_matches(*pid, *start) {
+                    if Self::identity_matches(&self.system, *pid, *start) {
                         if let Some(p) = self.system.process(Pid::from_u32(*pid)) {
                             let _ = p.kill_with(Signal::Term);
                         }
@@ -445,7 +471,7 @@ impl ManagedProcess {
             // Every independently signaled PID still requires its original birth time.
             self.refresh_processes();
             for (pid, start) in self.descendants.iter().rev() {
-                if self.identity_matches(*pid, *start) {
+                if Self::identity_matches(&self.system, *pid, *start) {
                     if let Some(p) = self.system.process(Pid::from_u32(*pid)) {
                         let _ = p.kill();
                     }

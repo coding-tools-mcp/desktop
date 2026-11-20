@@ -282,11 +282,12 @@ impl Storage {
             }
         }
         // Keep the one preference still known; everything else starts empty.
-        if language != Settings::default().language && !self.home.join("profiles.json").exists() {
-            let mut config = Config::default();
-            config.settings.language = language;
-            self.save(&config)?;
-        }
+        // Always commit the empty configuration: when a legacy profiles.json
+        // remains, load() would otherwise re-import (or re-fail on) the old
+        // workspaces the user just agreed to leave behind.
+        let mut config = Config::default();
+        config.settings.language = language;
+        self.save(&config)?;
         Ok(())
     }
     /// Language for dialogs shown before the configuration can be loaded.
@@ -482,6 +483,22 @@ mod tests {
             .collect();
         kept.sort();
         assert_eq!(kept, ["{also damaged", "{damaged"]);
+    }
+    #[test]
+    fn start_fresh_does_not_revive_legacy_profiles() {
+        let home = tempfile::tempdir().unwrap();
+        let storage = Storage::open(home.path().to_owned()).unwrap();
+        std::fs::write(
+            home.path().join("profiles.json"),
+            r#"{"profiles":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"old"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(home.path().join(CONFIG_FILE), "{damaged").unwrap();
+        std::fs::write(home.path().join(CONFIG_BACKUP), "{also damaged").unwrap();
+        storage.start_fresh().unwrap();
+        let fresh = storage.load().unwrap().0;
+        assert!(fresh.workspaces.is_empty(), "legacy workspaces revived");
+        assert!(home.path().join("profiles.json").exists());
     }
     #[test]
     fn legacy_verbatim_windows_paths_are_normalized_on_load() {
