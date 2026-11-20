@@ -437,6 +437,29 @@ fn basic_is_enforced_before_the_core() {
     }
     let anonymous = initialize(&client, &url).send().unwrap();
     assert!(challenge(&anonymous).starts_with("Basic "));
+    assert!(anonymous
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+    // A page the core allows must be able to read the refusal and ask again.
+    let page = "http://localhost:6274";
+    let browser = initialize(&client, &url)
+        .header("Origin", page)
+        .send()
+        .unwrap();
+    assert_eq!(browser.status(), 401);
+    assert!(challenge(&browser).starts_with("Basic "));
+    assert_eq!(browser.headers()["access-control-allow-origin"], page);
+    assert_eq!(browser.headers()["vary"], "Origin");
+    let foreign = initialize(&client, &url)
+        .header("Origin", "https://elsewhere.example")
+        .send()
+        .unwrap();
+    assert_eq!(foreign.status(), 401);
+    assert!(foreign
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
     // The core's own token is not a way around the password.
     let bearer = initialize(&client, &url)
         .bearer_auth(&password)
@@ -795,12 +818,24 @@ fn official_core_mcp_acceptance_behind_the_gateway() {
             rpc(&format!("{base}/mcp"), None, "initialize", init.clone()).status(),
             401
         );
-        assert!(c
+        let card = c
             .get(format!("{base}/.well-known/mcp.json"))
             .send()
-            .unwrap()
-            .status()
-            .is_success());
+            .unwrap();
+        assert!(card.status().is_success());
+        let card: serde_json::Value = card.json().unwrap();
+        let scheme = if auth == "basic" { "Basic" } else { "Bearer" };
+        assert_eq!(card["auth"]["scheme"], scheme);
+        // The core lets loopback pages read responses; a refusal is one too.
+        let page = "http://localhost:6274";
+        let refused = c
+            .post(format!("{base}/mcp"))
+            .header("Origin", page)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init}))
+            .send()
+            .unwrap();
+        assert_eq!(refused.status(), 401);
+        assert_eq!(refused.headers()["access-control-allow-origin"], page);
         // Connect exactly as the copied client configuration says to.
         let entry = entry(&m, &w);
         let url = entry["url"].as_str().unwrap();

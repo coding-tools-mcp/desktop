@@ -38,6 +38,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def do_OPTIONS(self):
+        # Like the core: loopback pages may read responses, other origins may not.
+        origin = self.headers.get('Origin', '')
+        if origin and not origin.startswith('http://localhost'):
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(204)
+        if origin:
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Vary', 'Origin')
+            self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+        self.end_headers()
+
     def do_POST(self):
         if args.oauth_mode:
             self.send_response(401)

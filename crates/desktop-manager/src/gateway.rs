@@ -8,7 +8,10 @@
 //! still decides what is public. It is not an MCP server and parses no bodies.
 use crate::model::{Secrets, Workspace};
 use base64::Engine;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited};
+use http_body_util::{
+    combinators::{BoxBody, UnsyncBoxBody},
+    BodyExt, Empty, Full, Limited,
+};
 use hyper::{
     body::{Bytes, Frame, Incoming, SizeHint},
     header::{self, HeaderMap, HeaderName, HeaderValue},
@@ -36,6 +39,7 @@ pub const DEFAULT_USERNAME: &str = "ctc";
 const MAX_CONNECTIONS: usize = 256;
 const REALM: &str = "coding-tools-mcp";
 const CARD_PATH: &str = "/.well-known/mcp.json";
+const CORS_WAIT: Duration = Duration::from_secs(5);
 const BODY_IDLE: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 30_000 });
 
 /// What a client must present to this gateway.
@@ -170,6 +174,7 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
+type Outbound = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 fn message(status: StatusCode, text: &str, challenge: Option<String>) -> Response<Body> {
     let body =
@@ -243,7 +248,33 @@ struct Context {
     upstream: u16,
     credential: Credential,
     bearer: HeaderValue,
-    client: Client<HttpConnector, Upload>,
+    client: Client<HttpConnector, Outbound>,
+}
+
+/// Which browser origins may read a response is the core's decision. Ask it
+/// with a preflight for the same origin and return what it allowed, so a
+/// refused sign-in is visible to the pages the core already serves.
+async fn cors_headers(context: &Context, origin: &HeaderValue) -> HeaderMap {
+    let mut allowed = HeaderMap::new();
+    let Ok(preflight) = Request::builder()
+        .method(Method::OPTIONS)
+        .uri(format!("http://127.0.0.1:{}/mcp", context.upstream))
+        .header(header::ORIGIN, origin)
+        .body(Empty::new().map_err(|e| match e {}).boxed_unsync())
+    else {
+        return allowed;
+    };
+    let answer = tokio::time::timeout(CORS_WAIT, context.client.request(preflight)).await;
+    if let Ok(Ok(answer)) = answer {
+        if answer.status().is_success() {
+            for (name, value) in answer.headers() {
+                if name == header::VARY || name.as_str().starts_with("access-control-") {
+                    allowed.append(name, value.clone());
+                }
+            }
+        }
+    }
+    allowed
 }
 
 async fn forward(
@@ -252,11 +283,17 @@ async fn forward(
 ) -> Result<Response<Body>, Infallible> {
     let accepted = context.credential.accepts(request.uri(), request.headers());
     if !accepted && !anonymous(request.method(), request.uri()) {
-        return Ok(message(
+        let mut denied = message(
             StatusCode::UNAUTHORIZED,
             "Unauthorized",
             Some(context.credential.challenge()),
-        ));
+        );
+        if let Some(origin) = request.headers().get(header::ORIGIN) {
+            denied
+                .headers_mut()
+                .extend(cors_headers(&context, origin).await);
+        }
+        return Ok(denied);
     }
     let Ok(target) = format!(
         "http://127.0.0.1:{}{}",
@@ -279,9 +316,9 @@ async fn forward(
     if accepted {
         headers.insert(header::AUTHORIZATION, context.bearer.clone());
     }
-    let request = request.map(|body| Upload {
-        body,
-        idle: Box::pin(tokio::time::sleep(BODY_IDLE)),
+    let request = request.map(|body| {
+        let idle = Box::pin(tokio::time::sleep(BODY_IDLE));
+        Upload { body, idle }.boxed_unsync()
     });
     Ok(match context.client.request(request).await {
         Ok(upstream) => {
