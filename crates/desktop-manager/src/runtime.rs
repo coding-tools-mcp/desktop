@@ -1,0 +1,1715 @@
+use crate::{
+    core, events,
+    model::*,
+    process::ManagedProcess,
+    storage::{private_json, valid_id, Storage},
+    tunnel,
+};
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, TcpListener},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Default)]
+struct Session {
+    runtime: Option<ManagedProcess>,
+    tunnel: Option<ManagedProcess>,
+    public_url: String,
+    last_local_probe: Option<Instant>,
+}
+
+struct Slot {
+    session: Mutex<Session>,
+    status: Mutex<Status>,
+    run_started_ms: Mutex<Option<i64>>,
+    deleted: AtomicBool,
+}
+pub struct Manager {
+    pub storage: Storage,
+    config: Mutex<Config>,
+    slots: Mutex<HashMap<String, Arc<Slot>>>,
+    migration_notice: Option<String>,
+    install_lock: Mutex<()>,
+    supervisor: Option<PathBuf>,
+    bundled_uv: Option<PathBuf>,
+    shutting_down: AtomicBool,
+}
+// Reuse one availability check for allocation, startup and Stop confirmation.
+// Unix safely reuses TIME_WAIT on loopback; macOS also guards the wildcard.
+// Windows uses a conservative exclusive IPv4 wildcard reservation. Specific
+// binds can coexist with wildcard listeners, and refused connects can mean a
+// full queue, so neither a specific bind alone nor a failed connect is proof.
+fn local_listener(port: u16) -> std::io::Result<TcpListener> {
+    #[cfg(target_os = "macos")]
+    let (port, _wildcard_guard) = {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::SocketAddr;
+        // BSD permits a reuse-enabled specific listener to coexist with a
+        // wildcard listener. Check the wildcard first, without ever listening
+        // on it, then keep that guard bound during the exact-endpoint check.
+        // This avoids stealing connections while retaining safe TIME_WAIT reuse.
+        let guard = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        guard.set_reuse_address(true)?;
+        guard.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+        (guard.local_addr()?.as_socket().unwrap().port(), guard)
+    };
+    #[cfg(not(windows))]
+    {
+        // std sets SO_REUSEADDR on Unix, never SO_REUSEPORT. An active
+        // listening socket on loopback or a dual-stack wildcard still wins.
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+    }
+    #[cfg(windows)]
+    {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::{net::SocketAddr, os::windows::io::AsRawSocket};
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, WSAGetLastError, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        let enabled: i32 = 1;
+        // Must be set before bind. Never use Windows SO_REUSEADDR: it can
+        // share/hijack another listener rather than prove the port is free.
+        let result = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as _,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of_val(&enabled) as i32,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }));
+        }
+        socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+        // Windows can overlap IPv4 and an earlier non-exclusive dual-stack
+        // listener. Hold only a bind while checking IPv6; listening earlier
+        // could steal traffic. Never signal or adopt a socket-table owner.
+        let reserved_port = socket.local_addr()?.as_socket().unwrap().port();
+        crate::windows_ports::ensure_no_ipv6_listener(reserved_port)?;
+        socket.listen(1)?;
+        Ok(socket.into())
+    }
+}
+
+fn confirm_port_release(port: u16) -> Result<()> {
+    let until = Instant::now() + Duration::from_secs(4);
+    loop {
+        match local_listener(port) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(());
+            }
+            Err(error) => {
+                if Instant::now() >= until {
+                    bail!("Owned processes are stopped, but release of 127.0.0.1:{port} could not be confirmed: {error}. Another process or pending TCP state may hold it. Retry Stop or choose another port; no unrelated process was terminated.");
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub fn validate_workspace_folder(input: &str) -> Result<String> {
+    let input = Path::new(input);
+    if !input.is_absolute() {
+        bail!("Enter an absolute workspace folder path");
+    }
+    let path = input
+        .canonicalize()
+        .context("Choose an existing workspace folder")?;
+    if !path.is_dir() {
+        bail!("Workspace must be a folder");
+    }
+    if path.parent().is_none() {
+        bail!("Choose a project folder, not a filesystem root");
+    }
+    if dirs::home_dir()
+        .and_then(|home| home.canonicalize().ok())
+        .as_ref()
+        == Some(&path)
+    {
+        bail!("Choose a project folder, not your entire home directory");
+    }
+    let text = path
+        .to_str()
+        .context("Workspace path must use valid UTF-8 characters")?;
+    #[cfg(windows)]
+    {
+        // Use normal Win32 path spelling for local drives and UNC shares.
+        // Keep the namespace intact for other device paths and long paths.
+        if text.encode_utf16().count() < 260 {
+            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+                return Ok(format!(r"\\{unc}"));
+            }
+            if let Some(drive) = text.strip_prefix(r"\\?\") {
+                if drive.as_bytes().get(1) == Some(&b':') {
+                    return Ok(drive.to_owned());
+                }
+            }
+        }
+    }
+    Ok(text.to_owned())
+}
+
+fn validate_access(w: &Workspace, starting: bool) -> Result<()> {
+    if !["local", "quick", "named", "frp"].contains(&w.access.as_str()) {
+        bail!("Unknown access mode");
+    }
+    if !["noauth", "bearer", "oauth"].contains(&w.auth.as_str()) {
+        bail!("Unknown authentication mode");
+    }
+    if !["safe", "trusted"].contains(&w.permission_mode.as_str()) {
+        bail!("Choose safe or trusted permissions before starting this workspace");
+    }
+    if w.access != "local" && w.auth == "noauth" {
+        bail!("Public access requires bearer-token or OAuth authentication. Repair this workspace before starting it.");
+    }
+    if w.access == "quick" && w.auth == "oauth" {
+        bail!("OAuth needs a fixed public address. Choose a named tunnel or bearer authentication for a temporary tunnel.");
+    }
+    if ["named", "frp"].contains(&w.access.as_str()) && (starting || !w.public_url.is_empty()) {
+        tunnel::validate_public_url(&w.public_url)?;
+    }
+    if !w.core_command.is_empty() && w.core_command[0].trim().is_empty() {
+        bail!("Custom core executable is empty");
+    }
+    Ok(())
+}
+impl Manager {
+    pub fn open(home: PathBuf) -> Result<Arc<Self>> {
+        Self::open_native(home, None, None)
+    }
+    /// Native Unix launches re-enter this executable in private supervisor mode.
+    /// Headless embedders may use `open` when they own their outer process lifetime.
+    pub fn open_supervised(home: PathBuf, supervisor: PathBuf) -> Result<Arc<Self>> {
+        Self::open_native(home, Some(supervisor), None)
+    }
+
+    /// The native shell resolves a bundled installer from its installed binary directory.
+    /// Headless use and unbundled developer builds keep external uv discovery.
+    pub fn open_native(
+        home: PathBuf,
+        supervisor: Option<PathBuf>,
+        bundled_uv: Option<PathBuf>,
+    ) -> Result<Arc<Self>> {
+        let manager = Arc::new(Self::load(home, supervisor, bundled_uv)?);
+        let weak = Arc::downgrade(&manager);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            let Some(m) = weak.upgrade() else { break };
+            m.refresh();
+        });
+        Ok(manager)
+    }
+
+    fn load(
+        home: PathBuf,
+        supervisor: Option<PathBuf>,
+        bundled_uv: Option<PathBuf>,
+    ) -> Result<Self> {
+        if supervisor
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute() || !core::is_executable_file(path))
+        {
+            bail!("Supervisor must be an absolute executable path");
+        }
+        let storage = Storage::open(home)?;
+        let (config, migration_notice) = storage.load()?;
+        Ok(Self {
+            storage,
+            config: Mutex::new(config),
+            slots: Mutex::new(HashMap::new()),
+            migration_notice,
+            install_lock: Mutex::new(()),
+            supervisor,
+            bundled_uv,
+            shutting_down: AtomicBool::new(false),
+        })
+    }
+    pub fn default_home() -> Result<PathBuf> {
+        Ok(dirs::home_dir()
+            .context("Home directory not found")?
+            .join(".coding-tools-mcp-desktop"))
+    }
+    fn ensure_active(&self) -> Result<()> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            bail!("Desktop is shutting down; no new operations can start");
+        }
+        Ok(())
+    }
+    fn config(&self) -> Config {
+        self.config.lock().unwrap().clone()
+    }
+    fn workspace(&self, id: &str) -> Result<(Workspace, Secrets)> {
+        Self::workspace_in(&self.config.lock().unwrap(), id)
+    }
+    fn workspace_in(c: &Config, id: &str) -> Result<(Workspace, Secrets)> {
+        valid_id(id)?;
+        let w = c
+            .workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .context("Workspace no longer exists")?
+            .clone();
+        let s = c.secrets.get(id).cloned().unwrap_or_default();
+        Ok((w, s))
+    }
+    fn slot(&self, w: &Workspace) -> Arc<Slot> {
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(w.id.to_ascii_lowercase())
+            .or_insert_with(|| {
+                Arc::new(Slot {
+                    session: Mutex::new(Session::default()),
+                    status: Mutex::new(Status::stopped(w)),
+                    run_started_ms: Mutex::new(None),
+                    deleted: AtomicBool::new(false),
+                })
+            })
+            .clone()
+    }
+    fn update(&self, slot: &Slot, update: impl FnOnce(&mut Status)) {
+        let mut s = slot.status.lock().unwrap();
+        update(&mut s);
+        s.checked_at = now();
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        // Saves publish configuration and stopped status under the same config
+        // lock. Keep that boundary here so one response cannot pair an old port,
+        // access mode or workspace list with status from a later save.
+        let (workspaces, settings, managed_core, previous_core, mut statuses) = {
+            let c = self.config.lock().unwrap();
+            let statuses: Vec<_> = c
+                .workspaces
+                .iter()
+                .map(|w| self.slot(w).status.lock().unwrap().clone())
+                .collect();
+            (
+                c.workspaces.clone(),
+                c.settings.clone(),
+                c.managed_core.clone(),
+                c.previous_core.clone(),
+                statuses,
+            )
+        };
+        let checked_now = chrono::Utc::now();
+        for status in &mut statuses {
+            if status.public_state == "ready"
+                && status
+                    .public_checked_at
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .is_none_or(|time| {
+                        checked_now.signed_duration_since(time) >= chrono::Duration::minutes(5)
+                    })
+            {
+                status.public_state = "unverified".into();
+                status.public_message =
+                    "Public discovery check expired; run diagnostics to verify the route.".into();
+            }
+        }
+        Snapshot {
+            statuses,
+            workspaces,
+            settings,
+            migration_notice: self.migration_notice.clone(),
+            core_available: match managed_core {
+                Some(path) => {
+                    Path::new(&path).is_absolute() && core::is_executable_file(Path::new(&path))
+                }
+                None => core::find_program("coding-tools-mcp").is_some(),
+            },
+            rollback_available: previous_core.is_some_and(|path| {
+                Path::new(&path).is_absolute() && core::is_executable_file(Path::new(&path))
+            }),
+            cloudflared_available: core::find_program("cloudflared").is_some(),
+        }
+    }
+    pub fn save_workspace(&self, mut w: Workspace, input: Option<Secrets>) -> Result<Workspace> {
+        if w.id.is_empty() {
+            w.id = uuid::Uuid::new_v4().simple().to_string();
+        }
+        valid_id(&w.id)?;
+        w.name = w.name.trim().to_owned();
+        if w.name.is_empty() || w.name.chars().count() > 120 {
+            bail!("Enter a workspace name of 1 to 120 characters");
+        }
+        w.path = validate_workspace_folder(&w.path)?;
+        validate_access(&w, false)?;
+        if ["named", "frp"].contains(&w.access.as_str()) && !w.public_url.is_empty() {
+            tunnel::validate_public_url(&w.public_url)?;
+            w.public_url = w.public_url.trim_end_matches('/').into();
+        }
+        if w.access == "local" || w.access == "quick" {
+            w.public_url.clear();
+        }
+        if w.core_command.iter().any(|a| a.contains('\0')) {
+            bail!("Executable arguments contain invalid characters");
+        }
+        let slot = self.slot(&w);
+        let session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is in progress"))?;
+        if session.runtime.is_some() || session.tunnel.is_some() {
+            bail!(
+                "Stop this workspace before saving configuration changes, including after a crash"
+            );
+        }
+        let mut c = self.config.lock().unwrap();
+        self.ensure_active()?;
+        if slot.deleted.load(Ordering::SeqCst) {
+            bail!("Workspace was removed; create a new workspace instead of saving a stale edit");
+        }
+        let name_key = w.name.to_lowercase();
+        let old = c.workspaces.iter().find(|old| old.id == w.id);
+        if old.is_none_or(|old| old.name.trim().to_lowercase() != name_key)
+            && c.workspaces
+                .iter()
+                .any(|other| other.id != w.id && other.name.trim().to_lowercase() == name_key)
+        {
+            bail!("A workspace already has this name; choose a different name");
+        }
+        let old_port = old.map(|old| old.port);
+        if w.port == 0 {
+            w.port = (28766..60000)
+                .find(|p| {
+                    !c.workspaces.iter().any(|x| x.id != w.id && x.port == *p)
+                        && local_listener(*p).is_ok()
+                })
+                .context("No available local port")?;
+        }
+        if c.workspaces
+            .iter()
+            .any(|x| x.id != w.id && x.port == w.port)
+        {
+            bail!("Another workspace already uses this port; choose a different port");
+        }
+        let mut next = c.clone();
+        let s = next
+            .secrets
+            .entry(w.id.clone())
+            .or_insert_with(Secrets::initialized);
+        if let Some(input) = input {
+            if input.values().iter().any(|s| s.len() > 8192) {
+                bail!("Credential exceeds maximum length");
+            }
+            s.merge(input);
+        }
+        w.token_configured = !s.cloudflare_token.is_empty();
+        if let Some(old) = next.workspaces.iter_mut().find(|x| x.id == w.id) {
+            *old = w.clone();
+        } else {
+            next.workspaces.push(w.clone());
+        }
+        self.storage.save(&next)?;
+        *c = next;
+        let mut status = slot.status.lock().unwrap();
+        let mut next_status = Status::stopped(&w);
+        if old_port == Some(w.port) && status.port_release_pending {
+            next_status.port_release_pending = true;
+            next_status.local_message = status.local_message.clone();
+        }
+        *status = next_status;
+        Ok(w)
+    }
+    pub fn delete_workspace(&self, id: &str) -> Result<()> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is in progress"))?;
+        if session.runtime.is_some() || session.tunnel.is_some() {
+            bail!("Stop the workspace before removing it, including after a crash");
+        }
+        let mut c = self.config.lock().unwrap();
+        self.ensure_active()?;
+        if !c.workspaces.iter().any(|w| w.id == id) {
+            bail!("Workspace no longer exists");
+        }
+        private_json(&self.storage.home.join("desktop-before-delete.json"), &*c)?;
+        let mut next = c.clone();
+        next.workspaces.retain(|w| w.id != id);
+        next.secrets.remove(id);
+        self.storage.save(&next)?;
+        *c = next;
+        slot.deleted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    pub fn start(&self, id: &str) -> Result<Status> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let mut session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is already in progress"))?;
+        self.ensure_active()?;
+        // Re-read after the lifecycle lock: a concurrent edit/delete may have
+        // completed since the initial lookup used to locate this stable slot.
+        let (w, secrets) = self.workspace(id)?;
+        self.start_locked(w, secrets, &slot, &mut session)
+    }
+    fn start_locked(
+        &self,
+        w: Workspace,
+        secrets: Secrets,
+        slot: &Slot,
+        session: &mut Session,
+    ) -> Result<Status> {
+        let id = &w.id;
+        if session.runtime.as_mut().is_some_and(|p| p.alive())
+            && !slot.status.lock().unwrap().cleanup_pending
+        {
+            return Ok(slot.status.lock().unwrap().clone());
+        }
+        self.update(slot, |s| {
+            s.state = "starting".into();
+            s.local_state = "starting".into();
+            s.local_message = "Starting the external Python core".into();
+        });
+        let mut spawned = false;
+        let result = (|| -> Result<()> {
+            // A dead leader may still own descendants or undrained readers.
+            // Confirm cleanup before replacing either retained process handle.
+            if let Some(old) = session.tunnel.as_mut() {
+                old.stop()
+                    .context("Could not clean up the previous tunnel")?;
+            }
+            session.tunnel = None;
+            if let Some(old) = session.runtime.as_mut() {
+                old.stop().context("Could not clean up the previous core")?;
+            }
+            session.runtime = None;
+            session.public_url.clear();
+            session.last_local_probe = None;
+            *slot.run_started_ms.lock().unwrap() = None;
+            self.update(slot, |s| {
+                *s = Status::stopped(&w);
+                s.state = "starting".into();
+                s.local_state = "starting".into();
+                s.local_message = "Starting the external Python core".into();
+            });
+            let state = self.storage.state_dir(id)?;
+            events::begin_runtime_log(&state.join("runtime.log"))
+                .context("Could not open a fresh runtime log")?;
+            validate_access(&w, true)?;
+            validate_workspace_folder(&w.path)?;
+            if w.port == 0 {
+                bail!("Workspace port is not configured; save the workspace to allocate it");
+            }
+            if w.auth == "bearer" && secrets.bearer_token.is_empty() {
+                bail!("Bearer credential is missing; save the workspace to generate one");
+            }
+            if w.auth == "oauth"
+                && (secrets.oauth_password.is_empty() || secrets.oauth_token_secret.is_empty())
+            {
+                bail!("OAuth credentials are missing; repair the workspace configuration");
+            }
+            let port = local_listener(w.port).map_err(|error| match error.kind() {
+                std::io::ErrorKind::AddrInUse => {
+                    anyhow!("Port is already in use. Choose another port.")
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    anyhow!("Permission denied for this port. Choose another port.")
+                }
+                _ => anyhow!("Could not check whether this port is available: {error}"),
+            })?;
+            drop(port);
+            events::begin_run(&state)?;
+            let mut cmd = core::command_supervised(
+                &w,
+                &secrets,
+                &self.config(),
+                &state,
+                self.supervisor.as_deref(),
+            )?;
+            #[cfg(unix)]
+            let process = if self.supervisor.is_some() {
+                ManagedProcess::spawn_supervised(
+                    &mut cmd,
+                    state.join("runtime.log"),
+                    secrets.clone(),
+                )?
+            } else {
+                ManagedProcess::spawn(&mut cmd, state.join("runtime.log"), secrets.clone())?
+            };
+            #[cfg(not(unix))]
+            let process =
+                ManagedProcess::spawn(&mut cmd, state.join("runtime.log"), secrets.clone())?;
+            // Transfer ownership before readiness. If startup or cleanup fails,
+            // Stop/Quit must still be able to retry this exact process handle.
+            session.runtime = Some(process);
+            spawned = true;
+            let process = session.runtime.as_mut().unwrap();
+            self.update(slot, |s| s.pid = Some(process.pid()));
+            // CPython's HTTPServer performs reverse-DNS lookup before listen.
+            // Some macOS resolver configurations take >30s; keep protocol
+            // readiness mandatory while allowing that supported core to finish.
+            let startup_budget = if cfg!(target_os = "macos") { 60 } else { 20 };
+            let deadline = Instant::now() + Duration::from_secs(startup_budget);
+            let mut last = "Waiting for MCP readiness".to_string();
+            let mut ready = false;
+            while Instant::now() < deadline {
+                if !process.alive() {
+                    bail!("Python core exited during startup. Open runtime logs for details.");
+                }
+                match core::probe(&w, &secrets, false) {
+                    Ok(message) => {
+                        last = message;
+                        ready = true;
+                        break;
+                    }
+                    Err(e) => last = format!("{e:#}"),
+                }
+                if cfg!(target_os = "macos") && process.started.elapsed().as_secs() >= 10 {
+                    self.update(slot,|s|s.local_message="Waiting for the Python core to finish starting. macOS hostname lookup can take about 30 seconds; readiness is still being checked.".into());
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            if !ready {
+                bail!("Core readiness check timed out: {last}");
+            }
+            // Seed birth identities before exposing a ready supervisor PID.
+            // A later helper crash can then stop its already observed core.
+            process.metrics();
+            let pid = process.pid();
+            *slot.run_started_ms.lock().unwrap() = Some(
+                chrono::Utc::now().timestamp_millis()
+                    - process.started.elapsed().as_millis() as i64,
+            );
+            let activity_available = state.join("events/journal.lock").is_file();
+            session.last_local_probe = Some(Instant::now());
+            self.update(slot, |s| {
+                s.activity_state = if activity_available {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+                .into();
+                s.activity_message = if activity_available {
+                    "Reading real calls from this core's private event journal"
+                } else {
+                    ""
+                }
+                .into();
+            });
+            self.update(slot, |s| {
+                s.state = "running".into();
+                s.pid = Some(pid);
+                s.local_state = "ready".into();
+                s.core_version = last
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("unknown")
+                    .trim_end_matches(':')
+                    .into();
+                s.local_message = last;
+            });
+            self.start_tunnel_inner(&w, &secrets, slot, session);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let mut message = events::redact(&format!("{e:#}"), &secrets);
+            if spawned {
+                if let Some(process) = session.runtime.as_mut() {
+                    match process.stop() {
+                        Ok(()) => session.runtime = None,
+                        Err(cleanup) => message.push_str(&events::redact(
+                            &format!("\nStartup cleanup is not confirmed. Retry Stop before editing or deleting: {cleanup:#}"),
+                            &secrets,
+                        )),
+                    }
+                }
+            }
+            *slot.run_started_ms.lock().unwrap() = None;
+            if let Some(log) = spawned.then(|| self.logs(id, "runtime", 0).ok()).flatten() {
+                let lines: Vec<_> = log.text.lines().rev().take(8).collect();
+                let tail = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+                if !tail.trim().is_empty() {
+                    message.push_str("\nCurrent startup output:\n");
+                    message.push_str(&tail.chars().take(4000).collect::<String>());
+                }
+            }
+            let live_pid = session
+                .runtime
+                .as_mut()
+                .and_then(|p| p.alive().then_some(p.pid()));
+            self.update(slot, |s| {
+                s.state = "error".into();
+                s.local_state = "error".into();
+                s.local_message = message.clone();
+                s.pid = live_pid;
+                s.cleanup_pending = session.runtime.is_some() || session.tunnel.is_some();
+                s.cpu_percent = 0.;
+                s.memory_bytes = 0;
+                s.uptime_seconds = 0;
+                s.activity_state = "unknown".into();
+                s.activity_message =
+                    "Core startup did not finish; inspect runtime logs and retry".into();
+                s.public_endpoint.clear();
+                s.public_checked_at = None;
+                s.public_state = if session.tunnel.is_some() {
+                    "error"
+                } else if w.access == "local" {
+                    "disabled"
+                } else {
+                    "stopped"
+                }
+                .into();
+                s.public_message = if session.tunnel.is_some() {
+                    "Tunnel cleanup is not confirmed. Retry Stop before editing or deleting."
+                } else if w.access == "local" {
+                    "Local access only"
+                } else {
+                    "Local MCP did not start; public access is unavailable"
+                }
+                .into();
+            });
+            return Err(anyhow!(message));
+        }
+        let result = slot.status.lock().unwrap().clone();
+        Ok(result)
+    }
+    fn start_tunnel_inner(
+        &self,
+        w: &Workspace,
+        secrets: &Secrets,
+        slot: &Slot,
+        session: &mut Session,
+    ) {
+        self.update(slot, |status| status.public_checked_at = None);
+        if let Some(old) = session.tunnel.as_mut() {
+            if let Err(error) = old.stop() {
+                self.update(slot, |s| {
+                    s.public_state = "error".into();
+                    s.cleanup_pending = true;
+                    s.public_endpoint.clear();
+                    s.public_message = events::redact(&format!("Could not stop the previous tunnel; replacement was not started: {error:#}"), secrets);
+                });
+                return;
+            }
+        }
+        session.tunnel = None;
+        session.public_url.clear();
+        if w.access == "local" {
+            self.update(slot, |s| {
+                s.public_state = "disabled".into();
+                s.public_message = "Local access only".into();
+                s.public_endpoint.clear();
+            });
+            return;
+        }
+        if w.access == "frp" {
+            session.public_url = w.public_url.trim_end_matches('/').into();
+            self.update(slot, |s| {
+                s.public_state = "unverified".into();
+                s.public_message =
+                    "FRP is externally managed. Run diagnostics to check its public address."
+                        .into();
+                s.public_endpoint = format!("{}/mcp", w.public_url.trim_end_matches('/'));
+            });
+            return;
+        }
+        self.update(slot, |s| {
+            s.public_state = "connecting".into();
+            s.public_message = "Connecting Cloudflare; local MCP is ready".into();
+            s.public_endpoint.clear();
+        });
+        let result = (|| -> Result<String> {
+            let dir = self.storage.state_dir(&w.id)?;
+            let process = tunnel::spawn_supervised(w, secrets, &dir, self.supervisor.as_deref())?;
+            session.tunnel = Some(process);
+            tunnel::wait_connected(session.tunnel.as_mut().unwrap(), w, secrets, &dir)
+        })();
+        match result {
+            Ok(url) => {
+                session.public_url = url.clone();
+                self.update(slot, |s| {
+                    s.public_state = "connected".into();
+                    s.cleanup_pending = false;
+                    s.public_message = if w.access == "quick" {
+                        "Temporary tunnel connected. Address changes when restarted."
+                    } else {
+                        "Fixed tunnel connected. Run diagnostics to verify the public route."
+                    }
+                    .into();
+                    s.public_endpoint = format!("{}/mcp", url.trim_end_matches('/'));
+                });
+            }
+            Err(e) => {
+                let mut message = format!("{e:#}");
+                if let Some(process) = session.tunnel.as_mut() {
+                    match process.stop() {
+                        Ok(()) => session.tunnel = None,
+                        Err(cleanup) => message.push_str(&format!("\nTunnel cleanup is not confirmed. Retry Stop or public access: {cleanup:#}")),
+                    }
+                }
+                self.update(slot, |s| {
+                    s.public_state = "error".into();
+                    s.cleanup_pending = session.tunnel.is_some();
+                    s.public_message = events::redact(&message, secrets);
+                    s.public_endpoint.clear();
+                });
+            }
+        }
+    }
+    pub fn retry_tunnel(&self, id: &str) -> Result<Status> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let mut session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is in progress"))?;
+        self.ensure_active()?;
+        let (w, s) = self.workspace(id)?;
+        if !session.runtime.as_mut().is_some_and(|p| p.alive()) {
+            bail!("Start local MCP before retrying public access");
+        }
+        self.start_tunnel_inner(&w, &s, &slot, &mut session);
+        let result = slot.status.lock().unwrap().clone();
+        Ok(result)
+    }
+    pub fn stop(&self, id: &str) -> Result<Status> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let mut session = slot.session.try_lock().map_err(|_| {
+            anyhow!("Workspace operation is in progress; wait for startup to finish")
+        })?;
+        let (w, _) = self.workspace(id)?;
+        self.stop_locked(&w, &slot, &mut session)
+    }
+    fn stop_locked(&self, w: &Workspace, slot: &Slot, session: &mut Session) -> Result<Status> {
+        self.update(slot, |s| {
+            s.state = "stopping".into();
+            s.local_message = "Stopping owned processes and verifying port release".into();
+        });
+        let result = (|| -> Result<()> {
+            if let Some(p) = session.tunnel.as_mut() {
+                p.stop()?;
+            }
+            session.tunnel = None;
+            if let Some(p) = session.runtime.as_mut() {
+                p.stop()?;
+            }
+            session.runtime = None;
+            *slot.run_started_ms.lock().unwrap() = None;
+            confirm_port_release(w.port)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let live_pid = session
+                .runtime
+                .as_mut()
+                .and_then(|p| p.alive().then_some(p.pid()));
+            self.update(slot, |s| {
+                s.state = "error".into();
+                s.local_state = "error".into();
+                s.local_message = e.to_string();
+                s.pid = live_pid;
+                s.cleanup_pending = session.runtime.is_some() || session.tunnel.is_some();
+                s.port_release_pending = !s.cleanup_pending;
+                s.public_endpoint.clear();
+                s.public_checked_at = None;
+                s.public_state = if session.tunnel.is_some() {
+                    "error"
+                } else if w.access == "local" {
+                    "disabled"
+                } else {
+                    "stopped"
+                }
+                .into();
+                if live_pid.is_none() {
+                    s.cpu_percent = 0.;
+                    s.memory_bytes = 0;
+                    s.uptime_seconds = 0;
+                }
+            });
+            return Err(e);
+        }
+        session.public_url.clear();
+        let status = Status::stopped(w);
+        *slot.status.lock().unwrap() = status.clone();
+        Ok(status)
+    }
+    pub fn restart(&self, id: &str) -> Result<Status> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let mut session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is already in progress"))?;
+        self.ensure_active()?;
+        let (w, secrets) = self.workspace(id)?;
+        // Do not let an edit or another lifecycle action enter between stop and start.
+        self.stop_locked(&w, &slot, &mut session)?;
+        self.ensure_active()?;
+        self.start_locked(w, secrets, &slot, &mut session)
+    }
+    pub fn refresh(&self) {
+        let c = self.config();
+        for w in c.workspaces {
+            let slot = self.slot(&w);
+            {
+                let status = slot.status.lock().unwrap();
+                // A stopped workspace (including a port held by someone else)
+                // has no process to poll. Do not contend with edits or removal.
+                if status.state != "running" && !status.cleanup_pending {
+                    continue;
+                }
+            }
+            let Ok(mut session) = slot.session.try_lock() else {
+                continue;
+            };
+            // Earlier workspaces may take seconds to probe. Never use the
+            // stale enumeration copy after a concurrent edit/restart/delete.
+            let Ok((w, secret)) = self.workspace(&w.id) else {
+                continue;
+            };
+            if let Some(p) = session.runtime.as_mut() {
+                if !p.alive() {
+                    let mut cleanup_errors = Vec::new();
+                    match p.stop() {
+                        Ok(()) => session.runtime = None,
+                        Err(error) => cleanup_errors.push(format!("Core cleanup: {error:#}")),
+                    }
+                    *slot.run_started_ms.lock().unwrap() = None;
+                    if let Some(t) = session.tunnel.as_mut() {
+                        match t.stop() {
+                            Ok(()) => session.tunnel = None,
+                            Err(error) => cleanup_errors.push(format!("Tunnel cleanup: {error:#}")),
+                        }
+                    }
+                    let secrets = &secret;
+                    let tunnel_cleanup_pending = session.tunnel.is_some();
+                    self.update(&slot, |s| {
+                        s.state = "error".into();
+                        s.local_state = "error".into();
+                        s.local_message = if cleanup_errors.is_empty() {
+                            "Python core exited unexpectedly. Inspect logs and restart.".into()
+                        } else {
+                            events::redact(&format!("Python core exited; cleanup is not confirmed. Retry Stop before editing or deleting. {}", cleanup_errors.join("; ")), secrets)
+                        };
+                        s.pid = None;
+                        s.cleanup_pending = session.runtime.is_some() || session.tunnel.is_some();
+                        s.cpu_percent = 0.;
+                        s.memory_bytes = 0;
+                        s.uptime_seconds = 0;
+                        s.public_state = if tunnel_cleanup_pending {
+                            "error"
+                        } else if w.access == "local" {
+                            "disabled"
+                        } else {
+                            "stopped"
+                        }.into();
+                        s.public_message = if tunnel_cleanup_pending {
+                            "Cloudflare cleanup is not confirmed. Retry Stop before editing or deleting."
+                        } else if w.access == "local" {
+                            "Local access only"
+                        } else {
+                            "Local MCP exited; public access is unavailable"
+                        }.into();
+                        s.public_endpoint.clear();
+                        s.public_checked_at = None;
+                    });
+                    continue;
+                }
+                let (cpu, memory) = p.metrics();
+                let uptime = p.started.elapsed().as_secs();
+                // Watch process exits at the normal cadence, but don't issue
+                // an MCP initialize on every metrics sample.
+                let health = if session
+                    .last_local_probe
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
+                {
+                    session.last_local_probe = Some(Instant::now());
+                    Some(core::probe(&w, &secret, false))
+                } else {
+                    None
+                };
+                self.update(&slot, |s| {
+                    s.cpu_percent = cpu;
+                    s.memory_bytes = memory;
+                    s.uptime_seconds = uptime;
+                    match health {
+                        Some(Ok(message)) => {
+                            s.local_state = "ready".into();
+                            s.local_message = message
+                        }
+                        Some(Err(e)) => {
+                            s.local_state = "unhealthy".into();
+                            s.local_message = e.to_string()
+                        }
+                        None => {}
+                    }
+                });
+            }
+            if let Some(t) = session.tunnel.as_mut() {
+                if !t.alive() {
+                    let cleanup = t.stop();
+                    if cleanup.is_ok() {
+                        session.tunnel = None;
+                    }
+                    let secrets = &secret;
+                    self.update(&slot,|s|{
+                        s.public_state="error".into();
+                        s.cleanup_pending = session.tunnel.is_some() || (s.state == "error" && session.runtime.is_some());
+                        s.public_message=match cleanup {
+                            Ok(()) => "Cloudflare process exited. Local MCP is still available; retry public access.".into(),
+                            Err(error) => events::redact(&format!("Cloudflare exited but cleanup is not confirmed. Retry Stop or public access: {error:#}"), secrets),
+                        };
+                        s.public_endpoint.clear();
+                        s.public_checked_at = None;
+                    });
+                }
+            }
+        }
+    }
+    pub fn activity(&self, id: &str) -> Result<Vec<Activity>> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let since = *slot.run_started_ms.lock().unwrap();
+        {
+            let dir = self.storage.state_dir(id)?;
+            let mut rows = events::activity(&dir.join("events"), since)?;
+            for i in 1..=3 {
+                rows.extend(events::activity(
+                    &dir.join(format!("events.previous.{i}")),
+                    None,
+                )?);
+            }
+            rows.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+            rows.truncate(200);
+            Ok(rows)
+        }
+    }
+    pub fn logs(&self, id: &str, kind: &str, cursor: u64) -> Result<Logs> {
+        let (_, s) = self.workspace(id)?;
+        let file = match kind {
+            "runtime" => "runtime.log",
+            "tunnel" => "tunnel.log",
+            _ => bail!("Unknown log stream"),
+        };
+        events::logs(&self.storage.state_dir(id)?.join(file), cursor, &s)
+    }
+    pub fn diagnose(&self, id: &str) -> Result<Vec<Diagnostic>> {
+        // Version probing owns a short-lived process too. Serialize it with
+        // maintenance/quit, and keep workspace identity stable through probes.
+        let _guard = self.install_lock.try_lock().map_err(|_| {
+            anyhow!("Another diagnostic, installation or Cloudflare setup is in progress")
+        })?;
+        self.ensure_active()?;
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is in progress"))?;
+        let (w, s) = self.workspace(id)?;
+        let mut rows = vec![];
+        let mut push = |name: &str, result: Result<String>| {
+            rows.push(match result {
+                Ok(message) => Diagnostic {
+                    level: "ok".into(),
+                    name: name.into(),
+                    message,
+                },
+                Err(e) => Diagnostic {
+                    level: "error".into(),
+                    name: name.into(),
+                    message: events::redact(&e.to_string(), &s),
+                },
+            })
+        };
+        push(
+            "Workspace folder",
+            if Path::new(&w.path).is_dir() {
+                Ok("Folder exists".into())
+            } else {
+                Err(anyhow!("Folder no longer exists"))
+            },
+        );
+        push(
+            "Core executable",
+            core::resolve(&w, &self.config())
+                .and_then(|args| core::version_output(&args, Path::new(&w.path))),
+        );
+        let running = slot.status.lock().unwrap().state == "running";
+        if running {
+            push("Local MCP protocol", core::probe(&w, &s, false));
+            if w.access != "local" {
+                push(
+                    "Public discovery",
+                    self.probe_public(&w, &s, &slot, &session),
+                );
+            }
+        } else {
+            for name in ["Local MCP protocol", "Public discovery"] {
+                if name == "Public discovery" && w.access == "local" {
+                    continue;
+                }
+                rows.push(Diagnostic {
+                    level: "warning".into(),
+                    name: name.into(),
+                    message: "Not running. Start the workspace to check its connection.".into(),
+                });
+            }
+        }
+        let activity_state = self.slot(&w).status.lock().unwrap().activity_state.clone();
+        let records = self.activity(id)?;
+        if activity_state == "unavailable" {
+            rows.push(Diagnostic{level:"warning".into(),name:"Tool activity".into(),message:"This Core can run tools, but does not record tool-call history. You can still connect and use it.".into()});
+        } else if records.is_empty() {
+            rows.push(Diagnostic {
+                level: "warning".into(),
+                name: "Tool activity".into(),
+                message: if running {
+                    "No tool calls recorded yet."
+                } else {
+                    "Not running. Start the workspace to check its connection."
+                }
+                .into(),
+            });
+        } else {
+            rows.push(Diagnostic {
+                level: "ok".into(),
+                name: "Tool activity".into(),
+                message: format!(
+                    "{} recent tool calls read from the core event journal",
+                    records.len()
+                ),
+            });
+        }
+        Ok(rows)
+    }
+    fn probe_public(
+        &self,
+        w: &Workspace,
+        secrets: &Secrets,
+        slot: &Slot,
+        session: &Session,
+    ) -> Result<String> {
+        let mut active = w.clone();
+        if !session.public_url.is_empty() {
+            active.public_url = session.public_url.clone();
+        }
+        tunnel::validate_public_url(&active.public_url)?;
+        let result = core::probe(&active, secrets, true);
+        self.update(slot, |status| {
+            status.public_checked_at = Some(now());
+            match &result {
+                Ok(message) => {
+                    status.public_state = "ready".into();
+                    status.public_message = message.clone();
+                }
+                Err(error) => {
+                    status.public_state = "error".into();
+                    status.public_message = events::redact(&error.to_string(), secrets);
+                }
+            }
+        });
+        result.map_err(|error| anyhow!(events::redact(&error.to_string(), secrets)))
+    }
+
+    pub fn check_public_route(&self, id: &str) -> Result<String> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is in progress"))?;
+        self.ensure_active()?;
+        let (w, secrets) = self.workspace(id)?;
+        if w.access == "local" {
+            bail!("Local access only");
+        }
+        self.probe_public(&w, &secrets, &slot, &session)
+    }
+
+    pub fn export_diagnostics(&self, id: &str) -> Result<String> {
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let status = slot.status.lock().unwrap().clone();
+        let diagnostics = self.diagnose(id)?;
+        // Intentionally exclude raw logs, credentials, paths, commands, URLs, workspace names and call payloads.
+        Ok(serde_json::to_string_pretty(
+            &json!({"desktopVersion":env!("CARGO_PKG_VERSION"),"platform":std::env::consts::OS,"state":status.state,"localState":status.local_state,"publicState":status.public_state,"cpuPercent":status.cpu_percent,"memoryBytes":status.memory_bytes,"uptimeSeconds":status.uptime_seconds,"checks":diagnostics.iter().map(|d|json!({"name":d.name,"level":d.level})).collect::<Vec<_>>(),"activity":self.activity(id)?.iter().map(|a|json!({"tool":a.tool,"outcome":a.outcome,"durationMs":a.duration_ms,"errorCategory":a.error_category})).collect::<Vec<_>>()}),
+        )?)
+    }
+    pub fn connection_config(&self, id: &str, public: bool) -> Result<String> {
+        let (w, s, endpoint) = {
+            let c = self.config.lock().unwrap();
+            let (w, s) = Self::workspace_in(&c, id)?;
+            let slot = self.slot(&w);
+            let status = slot.status.lock().unwrap();
+            let endpoint = if public {
+                if status.public_endpoint.is_empty() {
+                    bail!("No active public endpoint");
+                }
+                status.public_endpoint.clone()
+            } else {
+                status.local_endpoint.clone()
+            };
+            (w, s, endpoint)
+        };
+        let mut entry = json!({"url":endpoint});
+        if w.auth == "bearer" {
+            entry["headers"] = json!({"Authorization":format!("Bearer {}",s.bearer_token)});
+        }
+        Ok(serde_json::to_string_pretty(
+            &json!({"mcpServers":{w.name:entry}}),
+        )?)
+    }
+    pub fn auth_details(&self, id: &str) -> Result<Value> {
+        let (w, s) = self.workspace(id)?;
+        Ok(match w.auth.as_str() {
+            "oauth" => json!({"auth":"oauth","oauthPassword":s.oauth_password}),
+            "bearer" => json!({"auth":"bearer","bearerToken":s.bearer_token}),
+            _ => json!({"auth":"noauth"}),
+        })
+    }
+    pub fn save_settings(&self, s: Settings) -> Result<Settings> {
+        if !["en", "zh"].contains(&s.language.as_str()) {
+            bail!("Unsupported language");
+        }
+        let mut c = self.config.lock().unwrap();
+        self.ensure_active()?;
+        let mut n = c.clone();
+        n.settings = s.clone();
+        self.storage.save(&n)?;
+        *c = n;
+        Ok(s)
+    }
+    pub fn settings(&self) -> Settings {
+        self.config().settings
+    }
+    pub fn workspace_path(&self, id: &str) -> Result<String> {
+        Ok(self.workspace(id)?.0.path)
+    }
+    pub fn install_core(&self, version: &str) -> Result<String> {
+        let _guard = self
+            .install_lock
+            .try_lock()
+            .map_err(|_| anyhow!("Core installation is already in progress"))?;
+        self.ensure_active()?;
+        let (path, pending) =
+            core::install_with_bundled_uv(&self.storage, version, self.bundled_uv.as_deref())?;
+        let mut c = self.config.lock().unwrap();
+        let mut n = c.clone();
+        n.previous_core = n.managed_core.clone();
+        n.managed_core = Some(path);
+        self.storage.save(&n)?;
+        let _ = pending.keep();
+        *c = n;
+        Ok(format!("Core {version} installed and verified. Running workspaces keep their current core until restarted."))
+    }
+    pub fn rollback_core(&self) -> Result<String> {
+        let _guard = self
+            .install_lock
+            .try_lock()
+            .map_err(|_| anyhow!("Core installation is in progress"))?;
+        self.ensure_active()?;
+        let previous = self
+            .config()
+            .previous_core
+            .context("No previous managed core is available")?;
+        core::managed_version_output(std::slice::from_ref(&previous), &self.storage.home)?;
+        let mut c = self.config.lock().unwrap();
+        let mut n = c.clone();
+        n.previous_core = n.managed_core.clone();
+        n.managed_core = Some(previous);
+        self.storage.save(&n)?;
+        *c = n;
+        Ok("Previous core restored. Restart workspaces when ready to use it.".into())
+    }
+    pub fn cloudflare_login(&self) -> Result<String> {
+        let _guard = self
+            .install_lock
+            .try_lock()
+            .map_err(|_| anyhow!("Another installation or Cloudflare setup is in progress"))?;
+        self.ensure_active()?;
+        tunnel::login(&self.storage.home)
+    }
+    pub fn setup_named_tunnel(&self, id: &str, name: &str, hostname: &str) -> Result<Workspace> {
+        let _guard = self
+            .install_lock
+            .try_lock()
+            .map_err(|_| anyhow!("Another installation or Cloudflare setup is in progress"))?;
+        self.ensure_active()?;
+        let (w, _) = self.workspace(id)?;
+        let slot = self.slot(&w);
+        let session = slot
+            .session
+            .try_lock()
+            .map_err(|_| anyhow!("Workspace operation is in progress"))?;
+        let (mut w, _) = self.workspace(id)?;
+        if session.runtime.is_some() || session.tunnel.is_some() {
+            bail!("Stop the workspace before configuring its fixed tunnel");
+        }
+        let (tunnel, credentials, url) = tunnel::setup(&w, name, hostname, &self.storage.home)?;
+        w.access = "named".into();
+        w.tunnel_name = tunnel;
+        w.credentials_file = credentials.to_string_lossy().into();
+        w.public_url = url;
+        w.token_configured = false;
+        if w.auth == "noauth" {
+            w.auth = "oauth".into();
+        }
+        let mut config = self.config.lock().unwrap();
+        let mut next = config.clone();
+        next.secrets
+            .entry(id.into())
+            .or_default()
+            .cloudflare_token
+            .clear();
+        *next
+            .workspaces
+            .iter_mut()
+            .find(|x| x.id == id)
+            .context("Workspace no longer exists")? = w.clone();
+        self.storage.save(&next)?;
+        *config = next;
+        let mut status = slot.status.lock().unwrap();
+        let mut next_status = Status::stopped(&w);
+        if status.port_release_pending {
+            next_status.port_release_pending = true;
+            next_status.local_message = status.local_message.clone();
+        }
+        *status = next_status;
+        Ok(w)
+    }
+    /// Quitting closes admission before enumerating services. Owned cleanup
+    /// must finish, but an unrelated listener cannot keep the desktop hostage.
+    pub fn shutdown(&self) -> Result<()> {
+        let _guard=self.install_lock.try_lock().map_err(|_|anyhow!("An installation or Cloudflare setup is in progress. Wait for it to finish before quitting."))?;
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let result = self.stop_all_inner(false);
+        if result.is_err() {
+            self.shutting_down.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+    pub fn stop_all(&self) -> Result<()> {
+        let _guard=self.install_lock.try_lock().map_err(|_|anyhow!("An installation or Cloudflare setup is in progress. Wait for it to finish before stopping services."))?;
+        self.stop_all_inner(true)
+    }
+    fn stop_all_inner(&self, require_port_release: bool) -> Result<()> {
+        let mut errors = vec![];
+        for w in self.config().workspaces {
+            let slot = self.slot(&w);
+            let managed = slot
+                .session
+                .try_lock()
+                .map(|s| s.runtime.is_some() || s.tunnel.is_some())
+                .unwrap_or(true);
+            let status = slot.status.lock().unwrap().clone();
+            if managed
+                || status.cleanup_pending
+                || (require_port_release && status.port_release_pending)
+            {
+                if let Err(e) = self.stop(&w.id) {
+                    // A stale port-only warning must never mask a concurrent
+                    // lifecycle operation or a newly retained owned handle.
+                    let port_only = slot.session.try_lock().is_ok_and(|session| {
+                        session.runtime.is_none()
+                            && session.tunnel.is_none()
+                            && slot.status.lock().unwrap().port_release_pending
+                    });
+                    if require_port_release || !port_only {
+                        errors.push(e.to_string());
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            bail!("{}", errors.join("; "));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_regressions {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Arc<Manager>, Workspace) {
+        let directory = tempfile::tempdir().unwrap();
+        // These tests control admission and refresh ordering explicitly. The
+        // periodic health check would introduce a third contender for the slot.
+        let manager = Arc::new(Manager::load(directory.path().join("home"), None, None).unwrap());
+        let workspace: Workspace = serde_json::from_value(json!({
+            "id":"1234567890abcdef1234567890abcdef",
+            "name":"Admission fixture",
+            "path":directory.path(),
+            "port":0
+        }))
+        .unwrap();
+        let workspace = manager.save_workspace(workspace, None).unwrap();
+        (directory, manager, workspace)
+    }
+
+    fn python_command(script: String) -> Vec<String> {
+        let name = std::env::var("PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        let executable = core::find_program(&name).expect("Python fixture executable");
+        vec![executable.to_string_lossy().into(), "-c".into(), script]
+    }
+
+    #[test]
+    fn concurrent_snapshots_never_pair_saved_workspace_settings_with_another_port() {
+        let (_dir, manager, mut workspace) = fixture();
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let reader = {
+            let manager = Arc::clone(&manager);
+            let ready = Arc::clone(&ready);
+            thread::spawn(move || {
+                ready.wait();
+                for _ in 0..300 {
+                    let snapshot = manager.snapshot();
+                    let w = &snapshot.workspaces[0];
+                    let status = &snapshot.statuses[0];
+                    assert_eq!(status.workspace_id, w.id);
+                    assert_eq!(
+                        status.local_endpoint,
+                        format!("http://127.0.0.1:{}/mcp", w.port)
+                    );
+                    thread::yield_now();
+                }
+            })
+        };
+        ready.wait();
+        for n in 0..20 {
+            workspace.port = 41000 + n % 2;
+            workspace = manager.save_workspace(workspace, None).unwrap();
+        }
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn rejected_start_excludes_previous_runtime_log_and_keeps_it_separate() {
+        let (_directory, manager, mut workspace) = fixture();
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        workspace.port = occupied.local_addr().unwrap().port();
+        let workspace = manager.save_workspace(workspace, None).unwrap();
+        let dir = manager.storage.state_dir(&workspace.id).unwrap();
+        events::append_log(&dir.join("runtime.log"), "PREVIOUS SUCCESS: POST 200\n").unwrap();
+
+        let error = manager.start(&workspace.id).unwrap_err().to_string();
+        assert!(error.contains("Port is already in use"), "{error}");
+        assert!(!error.contains("PREVIOUS SUCCESS"), "{error}");
+        assert_eq!(manager.logs(&workspace.id, "runtime", 0).unwrap().text, "");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("runtime.log.previous")).unwrap(),
+            "PREVIOUS SUCCESS: POST 200\n"
+        );
+        assert!(occupied.local_addr().is_ok());
+    }
+
+    #[test]
+    fn stopped_workspace_reports_connection_as_not_running() {
+        let (_directory, manager, workspace) = fixture();
+        let checks = manager.diagnose(&workspace.id).unwrap();
+        let protocol = checks
+            .iter()
+            .find(|row| row.name == "Local MCP protocol")
+            .unwrap();
+        assert_eq!(protocol.level, "warning");
+        assert!(protocol.message.starts_with("Not running."));
+    }
+
+    #[test]
+    fn rejected_restart_does_not_stop_or_change_status() {
+        let (_dir, manager, workspace) = fixture();
+        let slot = manager.slot(&workspace);
+        manager.update(&slot, |status| {
+            status.local_message = "Before restart".into()
+        });
+        manager.shutting_down.store(true, Ordering::SeqCst);
+        assert!(manager.restart(&workspace.id).is_err());
+        assert_eq!(
+            manager.snapshot().statuses[0].local_message,
+            "Before restart"
+        );
+    }
+
+    #[test]
+    fn rollback_availability_tracks_the_previous_executable_without_running_it() {
+        let (_dir, manager, _) = fixture();
+        assert!(!manager.snapshot().rollback_available);
+        manager.config.lock().unwrap().previous_core =
+            Some(std::env::current_exe().unwrap().to_string_lossy().into());
+        assert!(manager.snapshot().rollback_available);
+        manager.config.lock().unwrap().previous_core = Some("definitely-missing".into());
+        assert!(!manager.snapshot().rollback_available);
+    }
+
+    #[test]
+    fn workspace_names_are_unique_on_create_and_rename() {
+        let (_directory, manager, original) = fixture();
+        let mut other = original.clone();
+        other.id.clear();
+        other.port = 0;
+        other.name = format!(" {} ", original.name.to_uppercase());
+        assert!(manager.save_workspace(other.clone(), None).is_err());
+        other.name = "测试工作区".into();
+        let mut other = manager.save_workspace(other, None).unwrap();
+        assert_eq!(other.name, "测试工作区");
+        other.name = original.name;
+        assert!(manager.save_workspace(other, None).is_err());
+    }
+
+    #[test]
+    fn accepts_existing_absolute_project_but_not_the_volume_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().ancestors().last().unwrap();
+        assert!(validate_workspace_folder(directory.path().to_str().unwrap()).is_ok());
+        assert!(validate_workspace_folder(root.to_str().unwrap()).is_err());
+        assert!(validate_workspace_folder("relative-project").is_err());
+    }
+
+    #[test]
+    fn warns_until_a_public_discovery_check_is_fresh() {
+        let (_directory, manager, workspace) = fixture();
+        let slot = manager.slot(&workspace);
+        manager.update(&slot, |state| {
+            state.public_state = "ready".into();
+            state.public_checked_at = Some("2000-01-01T00:00:00Z".into());
+        });
+        assert_eq!(manager.snapshot().statuses[0].public_state, "unverified");
+        manager.update(&slot, |state| state.public_checked_at = Some(now()));
+        assert_eq!(manager.snapshot().statuses[0].public_state, "ready");
+    }
+
+    #[test]
+    fn preserves_pending_port_warning_only_for_the_same_port() {
+        let (_directory, manager, mut workspace) = fixture();
+        let slot = manager.slot(&workspace);
+        manager.update(&slot, |state| {
+            state.port_release_pending = true;
+            state.local_message = "Port release unverified".into();
+        });
+        workspace.name.push_str(" renamed");
+        let mut workspace = manager.save_workspace(workspace, None).unwrap();
+        assert!(manager.snapshot().statuses[0].port_release_pending);
+        workspace.port = if workspace.port == 65000 {
+            64999
+        } else {
+            65000
+        };
+        manager.save_workspace(workspace, None).unwrap();
+        assert!(!manager.snapshot().statuses[0].port_release_pending);
+    }
+    #[test]
+    fn failed_start_clears_stale_runtime_and_public_readiness() {
+        let (_directory, manager, mut workspace) = fixture();
+        workspace.core_command = python_command("raise SystemExit(2)".into());
+        let workspace = manager.save_workspace(workspace, None).unwrap();
+        let slot = manager.slot(&workspace);
+        manager.update(&slot, |status| {
+            status.state = "error".into();
+            status.pid = Some(123456);
+            status.public_state = "ready".into();
+            status.public_endpoint = "https://old.example.invalid/mcp".into();
+            status.memory_bytes = 4096;
+            status.cpu_percent = 12.;
+            status.uptime_seconds = 42;
+            status.activity_state = "available".into();
+        });
+        assert!(manager.start(&workspace.id).is_err());
+        let status = manager.snapshot().statuses.remove(0);
+        assert_eq!(status.state, "error");
+        assert_eq!(
+            status.pid, None,
+            "a failed start exposed the old process PID"
+        );
+        assert_eq!(status.public_state, "disabled");
+        assert!(status.public_endpoint.is_empty());
+        assert_eq!(status.memory_bytes, 0);
+        assert_eq!(status.cpu_percent, 0.);
+        assert_eq!(status.uptime_seconds, 0);
+        assert_eq!(status.activity_state, "unknown");
+        assert!(slot.session.lock().unwrap().runtime.is_none());
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn quit_finishes_owned_cleanup_without_claiming_an_unrelated_port_was_released() {
+        let (directory, manager, workspace) = fixture();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, workspace.port)).unwrap();
+        let args = python_command("import time; time.sleep(60)".into());
+        let mut command = std::process::Command::new(&args[0]);
+        command.args(&args[1..]);
+        let mut process = ManagedProcess::spawn(
+            &mut command,
+            directory.path().join("owned.log"),
+            Secrets::default(),
+        )
+        .unwrap();
+        assert!(process.alive(), "owned fixture did not remain running");
+        let slot = manager.slot(&workspace);
+        manager.update(&slot, |status| {
+            status.state = "running".into();
+            status.pid = Some(process.pid());
+        });
+        slot.session.lock().unwrap().runtime = Some(process);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match manager.shutdown() {
+                Err(error)
+                    if error.to_string().contains("operation is in progress")
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                result => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+        assert!(slot.session.lock().unwrap().runtime.is_none());
+        let status = slot.status.lock().unwrap();
+        assert!(status.port_release_pending);
+        assert!(!status.cleanup_pending);
+        assert_eq!(status.pid, None);
+        assert!(std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, workspace.port)),
+            Duration::from_millis(200)
+        )
+        .is_ok());
+        drop(listener);
+    }
+
+    #[test]
+    fn stale_port_warning_does_not_hide_an_inflight_operation_from_quit() {
+        let (_directory, manager, workspace) = fixture();
+        let slot = manager.slot(&workspace);
+        manager.update(&slot, |status| status.port_release_pending = true);
+        let operation = slot.session.lock().unwrap();
+        assert!(manager.shutdown().is_err());
+        assert!(!manager.shutting_down.load(Ordering::SeqCst));
+        drop(operation);
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn availability_probe_uses_platform_safe_socket_reuse() {
+        let listener = local_listener(0).unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&listener).reuse_address().unwrap(),
+            cfg!(unix)
+        );
+        assert_eq!(
+            listener.local_addr().unwrap().ip(),
+            if cfg!(windows) {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                Ipv4Addr::LOCALHOST
+            }
+        );
+    }
+
+    #[test]
+    fn busy_workspace_shutdown_rolls_back_admission_without_deadlock() {
+        let (_directory, manager, mut workspace) = fixture();
+        let slot = manager.slot(&workspace);
+        let operation = slot.session.lock().unwrap();
+        assert!(manager.shutdown().is_err());
+        assert!(!manager.shutting_down.load(Ordering::SeqCst));
+        drop(operation);
+        workspace.name = "Still editable after failed shutdown".into();
+        manager.save_workspace(workspace, None).unwrap();
+        manager.shutdown().unwrap();
+        assert!(manager.shutting_down.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn active_installation_prevents_shutdown_before_admission_changes() {
+        let (_directory, manager, _) = fixture();
+        let installation = manager.install_lock.lock().unwrap();
+        assert!(manager.shutdown().is_err());
+        assert!(!manager.shutting_down.load(Ordering::SeqCst));
+        manager.ensure_active().unwrap();
+        drop(installation);
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn deleted_workspace_case_alias_cannot_resurrect_a_stale_edit() {
+        let (_directory, manager, mut workspace) = fixture();
+        manager.delete_workspace(&workspace.id).unwrap();
+        workspace.id = workspace.id.to_ascii_uppercase();
+        assert!(
+            manager.save_workspace(workspace, None).is_err(),
+            "case-only spelling bypassed the deleted-workspace tombstone"
+        );
+        assert!(manager.snapshot().workspaces.is_empty());
+    }
+
+    #[test]
+    fn closed_admission_rejects_diagnostics_before_spawning_a_probe() {
+        let (directory, manager, mut workspace) = fixture();
+        let marker = directory.path().join("probe-spawned");
+        let marker_literal = serde_json::to_string(marker.to_str().unwrap()).unwrap();
+        workspace.core_command = python_command(format!("from pathlib import Path; Path({marker_literal}).write_text('spawned'); print('coding-tools-mcp 0.5.0')"));
+        let workspace = manager.save_workspace(workspace, None).unwrap();
+        manager.shutdown().unwrap();
+        let result = manager.diagnose(&workspace.id);
+        assert!(result.is_err(), "diagnostics were admitted after shutdown");
+        assert!(
+            !marker.exists(),
+            "a new unsupervised probe started after shutdown"
+        );
+    }
+
+    #[test]
+    fn an_inflight_diagnostic_probe_prevents_shutdown_completion() {
+        let (directory, manager, mut workspace) = fixture();
+        let marker = directory.path().join("probe-started");
+        let gate = directory.path().join("finish-probe");
+        let marker_literal = serde_json::to_string(marker.to_str().unwrap()).unwrap();
+        let gate_literal = serde_json::to_string(gate.to_str().unwrap()).unwrap();
+        workspace.core_command = python_command(format!("from pathlib import Path\nimport time\nPath({marker_literal}).write_text('spawned')\nwhile not Path({gate_literal}).exists(): time.sleep(0.01)\nprint('coding-tools-mcp 0.5.0')\n"));
+        let workspace = manager.save_workspace(workspace, None).unwrap();
+        let diagnosing = manager.clone();
+        let handle = thread::spawn(move || diagnosing.diagnose(&workspace.id));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !marker.exists() && !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let observed_probe = marker.exists();
+        let shutdown = manager.shutdown();
+        std::fs::write(gate, b"finish").unwrap();
+        let rows = handle.join().unwrap().expect("diagnostic admission failed");
+        let probe = rows
+            .iter()
+            .find(|row| row.name == "Core executable")
+            .unwrap();
+        assert!(
+            observed_probe,
+            "fixture probe never started: {}",
+            probe.message
+        );
+        assert_eq!(probe.level, "ok", "{}", probe.message);
+        assert!(
+            shutdown.is_err(),
+            "shutdown completed while an unsupervised diagnostic probe was running"
+        );
+        assert!(!manager.shutting_down.load(Ordering::SeqCst));
+        manager.shutdown().unwrap();
+    }
+}
