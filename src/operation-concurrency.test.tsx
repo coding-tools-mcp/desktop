@@ -423,7 +423,7 @@ describe("concurrent failure feedback", () => {
         name: "Operation feedback",
       });
       expect(feedback).toHaveTextContent(
-        "Install version: Installation needs a retry",
+        "Core installation: Installation needs a retry",
       );
       if (stopFails) expect(feedback).toHaveTextContent("Stop needs a retry");
       expect(

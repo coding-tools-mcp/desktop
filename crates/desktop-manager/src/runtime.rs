@@ -148,20 +148,18 @@ pub fn validate_workspace_folder(input: &str) -> Result<String> {
         .context("Workspace path must use valid UTF-8 characters")?;
     #[cfg(windows)]
     {
-        // Use normal Win32 path spelling for local drives and UNC shares.
-        // Keep the namespace intact for other device paths and long paths.
-        if text.encode_utf16().count() < 260 {
-            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-                return Ok(format!(r"\\{unc}"));
-            }
-            if let Some(drive) = text.strip_prefix(r"\\?\") {
-                if drive.as_bytes().get(1) == Some(&b':') {
-                    return Ok(drive.to_owned());
-                }
-            }
+        if let Some(plain) = crate::storage::plain_windows_path(text) {
+            return Ok(plain);
         }
     }
     Ok(text.to_owned())
+}
+
+fn exit_note(code: Option<i32>) -> String {
+    code.map_or_else(
+        || "Core process exit code: unknown\n".into(),
+        |code| format!("Core process exit code: {code}\n"),
+    )
 }
 
 fn validate_access(w: &Workspace, starting: bool) -> Result<()> {
@@ -228,6 +226,7 @@ impl Manager {
         }
         let storage = Storage::open(home)?;
         let (config, migration_notice) = storage.load()?;
+        core::remove_stale_installs(&storage.home, &config);
         Ok(Self {
             storage,
             config: Mutex::new(config),
@@ -483,6 +482,7 @@ impl Manager {
             s.local_message = "Starting the external Python core".into();
         });
         let mut spawned = false;
+        let mut exited: Option<Option<i32>> = None;
         let result = (|| -> Result<()> {
             // A dead leader may still own descendants or undrained readers.
             // Confirm cleanup before replacing either retained process handle.
@@ -566,6 +566,7 @@ impl Manager {
             let mut ready = false;
             while Instant::now() < deadline {
                 if !process.alive() {
+                    exited = Some(process.exit_code());
                     bail!("Python core exited during startup. Open runtime logs for details.");
                 }
                 match core::probe(&w, &secrets, false) {
@@ -637,6 +638,11 @@ impl Manager {
                 }
             }
             *slot.run_started_ms.lock().unwrap() = None;
+            if let (Some(code), Ok(state)) = (exited, self.storage.state_dir(id)) {
+                // A core can exit without printing anything; never leave the
+                // log this failure points at empty.
+                let _ = events::append_log(&state.join("runtime.log"), &exit_note(code));
+            }
             if let Some(log) = spawned.then(|| self.logs(id, "runtime", 0).ok()).flatten() {
                 let lines: Vec<_> = log.text.lines().rev().take(8).collect();
                 let tail = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
@@ -883,8 +889,14 @@ impl Manager {
             if let Some(p) = session.runtime.as_mut() {
                 if !p.alive() {
                     let mut cleanup_errors = Vec::new();
+                    let note = exit_note(p.exit_code());
                     match p.stop() {
-                        Ok(()) => session.runtime = None,
+                        Ok(()) => {
+                            session.runtime = None;
+                            if let Ok(state) = self.storage.state_dir(&w.id) {
+                                let _ = events::append_log(&state.join("runtime.log"), &note);
+                            }
+                        }
                         Err(error) => cleanup_errors.push(format!("Core cleanup: {error:#}")),
                     }
                     *slot.run_started_ms.lock().unwrap() = None;
@@ -900,7 +912,7 @@ impl Manager {
                         s.state = "error".into();
                         s.local_state = "error".into();
                         s.local_message = if cleanup_errors.is_empty() {
-                            "Python core exited unexpectedly. Inspect logs and restart.".into()
+                            format!("Python core exited unexpectedly. Inspect logs and restart.\n{}", note.trim_end())
                         } else {
                             events::redact(&format!("Python core exited; cleanup is not confirmed. Retry Stop before editing or deleting. {}", cleanup_errors.join("; ")), secrets)
                         };
@@ -1194,6 +1206,14 @@ impl Manager {
         *c = n;
         Ok(s)
     }
+    /// True only the first time the window is hidden to the tray.
+    pub fn claim_tray_hint(&self) -> bool {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.storage.home.join("tray-hint-shown"))
+            .is_ok()
+    }
     pub fn settings(&self) -> Settings {
         self.config().settings
     }
@@ -1367,6 +1387,56 @@ mod admission_regressions {
             .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
         let executable = core::find_program(&name).expect("Python fixture executable");
         vec![executable.to_string_lossy().into(), "-c".into(), script]
+    }
+
+    #[test]
+    fn silent_startup_exit_records_its_exit_code_in_the_runtime_log() {
+        let (_directory, manager, mut workspace) = fixture();
+        workspace.core_command = python_command(
+            "import sys; print('coding-tools-mcp 0.5.0') if '--version' in sys.argv else sys.exit(7)"
+                .into(),
+        );
+        let workspace = manager.save_workspace(workspace, None).unwrap();
+        let error = manager.start(&workspace.id).unwrap_err().to_string();
+        assert!(error.contains("Core process exit code: 7"), "{error}");
+        assert!(manager
+            .logs(&workspace.id, "runtime", 0)
+            .unwrap()
+            .text
+            .contains("Core process exit code: 7"));
+    }
+
+    #[test]
+    fn startup_removes_only_unreferenced_interrupted_core_installs() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let cores = home.join("cores");
+        for name in ["0.5.0-AbC123", "0.5.0-kept12", "0.5.0-prev12", "custom"] {
+            std::fs::create_dir_all(cores.join(name).join("bin")).unwrap();
+        }
+        let core = |name: &str| {
+            Some(
+                cores
+                    .join(name)
+                    .join("bin/coding-tools-mcp")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        let config = Config {
+            managed_core: core("0.5.0-kept12"),
+            previous_core: core("0.5.0-prev12"),
+            ..Default::default()
+        };
+        Storage::open(home.clone()).unwrap().save(&config).unwrap();
+        Manager::load(home, None, None).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(cores)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["0.5.0-kept12", "0.5.0-prev12", "custom"]);
     }
 
     #[test]
