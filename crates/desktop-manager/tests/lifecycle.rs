@@ -324,7 +324,8 @@ fn url_token_is_enforced_before_the_core_and_never_forwarded() {
     let (_test_guard, d, m) = manager();
     let mut w = workspace(d.path());
     w.auth = "url-token".into();
-    let token = "url+token/=&x";
+    // Saved as typed, including what a bearer header could not carry.
+    let token = " url+tökén/=&x ";
     let w = m
         .save_workspace(
             w,
@@ -342,8 +343,8 @@ fn url_token_is_enforced_before_the_core_and_never_forwarded() {
     for url in [
         format!("{base}/mcp"),
         format!("{base}/mcp?token="),
-        format!("{base}/mcp?token=url%2Btoken"),
-        format!("{base}/mcp?Token=url%2Btoken%2F%3D%26x"),
+        format!("{base}/mcp?token=url%2Bt%C3%B6k%C3%A9n%2F%3D%26x"),
+        format!("{base}/mcp?Token=+url%2Bt%C3%B6k%C3%A9n%2F%3D%26x+"),
     ] {
         let denied = initialize(&client, &url).send().unwrap();
         assert_eq!(denied.status(), 401, "{url}");
@@ -362,7 +363,10 @@ fn url_token_is_enforced_before_the_core_and_never_forwarded() {
 
     let entry = entry(&m, &w);
     let url = entry["url"].as_str().unwrap();
-    assert_eq!(url, format!("{base}/mcp?token=url%2Btoken%2F%3D%26x"));
+    assert_eq!(
+        url,
+        format!("{base}/mcp?token=+url%2Bt%C3%B6k%C3%A9n%2F%3D%26x+")
+    );
     assert!(entry["headers"].is_null());
     let accepted = initialize(&client, url).send().unwrap();
     assert_eq!(accepted.status(), 200);
@@ -371,11 +375,6 @@ fn url_token_is_enforced_before_the_core_and_never_forwarded() {
         .send()
         .unwrap();
     assert_eq!(mixed.headers()["x-fixture-target"], "/mcp?cursor=a%20b");
-    let header = initialize(&client, &format!("{base}/mcp"))
-        .bearer_auth(token)
-        .send()
-        .unwrap();
-    assert_eq!(header.status(), 200);
 
     // Discovery stays public, and is forwarded without the core's credential.
     let discovery = client
