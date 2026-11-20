@@ -5,7 +5,9 @@ use std::sync::{
     Arc,
 };
 use tauri::{Emitter, Manager as _, State};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_dialog::{
+    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+};
 type AppManager = Arc<Manager>;
 async fn work<T: Send + 'static>(
     manager: AppManager,
@@ -291,57 +293,170 @@ fn request_quit(app: tauri::AppHandle) {
             Err(error) => {
                 show(&app);
                 let _ = app.emit("shutdown-error", &error);
+                let zh = app.state::<AppManager>().settings().language == "zh";
                 app.dialog()
                     .message(error)
-                    .title("Could not stop services")
+                    .title(tr(zh, "Could not stop services", "无法停止服务"))
                     .kind(tauri_plugin_dialog::MessageDialogKind::Error)
                     .show(|_| {});
             }
         }
     });
 }
+/// Native dialogs appear before, or without, the web UI and its translations.
+fn tr(zh: bool, en: &'static str, chinese: &'static str) -> &'static str {
+    if zh {
+        chinese
+    } else {
+        en
+    }
+}
+fn startup_reason(zh: bool, error: &desktop_manager::Error) -> String {
+    let text = format!("{error:#}");
+    if !zh {
+        return text;
+    }
+    let known = [
+        (
+            desktop_manager::storage::LOCKED,
+            "另一个桌面管理器正在使用此配置",
+        ),
+        (
+            "Configuration is invalid; original files were preserved",
+            "配置文件无效；原始文件已保留",
+        ),
+        (
+            "The main desktop configuration is missing; restore it from backup",
+            "主配置文件缺失；请从备份恢复",
+        ),
+        ("Could not read desktop configuration", "无法读取桌面配置"),
+        ("Configuration is not valid JSON", "配置不是有效的 JSON"),
+        (
+            "Unsupported configuration version; use a compatible desktop release",
+            "不支持的配置版本；请使用兼容的桌面版本",
+        ),
+    ];
+    known
+        .iter()
+        .fold(text, |text, (en, chinese)| text.replace(en, chinese))
+}
 fn startup_error(app: &tauri::App, error: desktop_manager::Error) {
-    use desktop_manager::storage::{Storage, CONFIG_BACKUP, CONFIG_FILE};
+    use desktop_manager::storage::{Storage, CONFIG_BACKUP, CONFIG_FILE, LOCKED};
     app.state::<AtomicBool>().store(true, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
     let handle = app.handle().clone();
     let home = Manager::default_home().ok();
+    let zh = home
+        .as_ref()
+        .is_some_and(|dir| Storage::preferred_language(dir) == "zh");
+    if format!("{error:#}").contains(LOCKED) {
+        // The running instance owns the configuration; nothing is damaged.
+        app.dialog()
+            .message(tr(
+                zh,
+                "Coding Tools MCP is already running. Open it from the system tray icon.",
+                "Coding Tools MCP 已在运行。请通过系统托盘图标打开。",
+            ))
+            .title(tr(
+                zh,
+                "Coding Tools MCP is already running",
+                "Coding Tools MCP 已在运行",
+            ))
+            .kind(MessageDialogKind::Info)
+            .show(move |_| handle.exit(0));
+        return;
+    }
     let preview = home
         .as_ref()
         .and_then(|dir| Storage::open(dir.clone()).ok()?.backup_preview());
     let location = home.as_ref().map_or(String::new(), |dir| {
         format!(
-            "\n\nConfiguration: {}\nBackup: {}",
+            "\n\n{}: {}\n{}: {}",
+            tr(zh, "Configuration", "配置文件"),
             dir.join(CONFIG_FILE).display(),
+            tr(zh, "Backup", "备份"),
             dir.join(CONFIG_BACKUP).display()
         )
     });
     let detail = preview.map_or_else(
-        || "No usable backup was found. Open the configuration folder to repair the files. Nothing was reset.".to_owned(),
+        || tr(zh, "No usable backup was found. Open the configuration folder to repair the files, or start fresh with an empty configuration. Damaged files are kept separately; nothing is deleted.", "未找到可用的备份。可以打开配置文件夹修复文件，或使用空白配置重新开始。损坏的文件会另行保留，不会被删除。").to_owned(),
         |(time, count)| {
             let local: chrono::DateTime<chrono::Local> = time.into();
-            format!("Backup saved {}; workspaces included: {count}. Changes made after this backup may be missing. The damaged file will be kept separately.", local.format("%Y-%m-%d %H:%M:%S %Z"))
+            let saved = local.format("%Y-%m-%d %H:%M:%S %Z");
+            if zh {
+                format!("备份保存于 {saved}；包含工作区：{count} 个。此备份之后所做的更改可能会丢失。损坏的文件会另行保留。")
+            } else {
+                format!("Backup saved {saved}; workspaces included: {count}. Changes made after this backup may be missing. The damaged file will be kept separately.")
+            }
         },
     );
+    let close = tr(zh, "Close", "关闭");
     let dialog = app
         .dialog()
-        .message(format!("{error:#}{location}\n\n{detail}"))
-        .title("Coding Tools MCP could not start")
+        .message(format!(
+            "{}{location}\n\n{detail}",
+            startup_reason(zh, &error)
+        ))
+        .title(tr(
+            zh,
+            "Coding Tools MCP could not start",
+            "Coding Tools MCP 无法启动",
+        ))
         .kind(MessageDialogKind::Error);
+    // Replace the unreadable files only on request, then start again.
+    let recover =
+        move |handle: tauri::AppHandle,
+              failure: &'static str,
+              action: fn(&Storage) -> Result<(), desktop_manager::Error>| {
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = Manager::default_home()
+                    .and_then(Storage::open)
+                    .and_then(|s| action(&s));
+                match result {
+                    Ok(()) => handle.request_restart(),
+                    Err(error) => {
+                        let app = handle.clone();
+                        handle
+                            .dialog()
+                            .message(format!("{failure}: {error:#}"))
+                            .kind(MessageDialogKind::Error)
+                            .show(move |_| app.exit(1));
+                    }
+                }
+            });
+        };
     if preview.is_none() {
         if let Some(dir) = home.filter(|dir| dir.is_dir()) {
+            let open_folder = tr(zh, "Open configuration folder", "打开配置文件夹");
+            let fresh = tr(zh, "Start fresh", "重新开始");
             dialog
-                .buttons(MessageDialogButtons::OkCancelCustom(
-                    "Open configuration folder".into(),
-                    "Close".into(),
+                .buttons(MessageDialogButtons::YesNoCancelCustom(
+                    open_folder.into(),
+                    fresh.into(),
+                    close.into(),
                 ))
-                .show(move |open_folder| {
-                    if open_folder {
+                .show_with_result(move |choice| match choice {
+                    MessageDialogResult::Custom(label) if label == fresh => recover(
+                        handle,
+                        tr(zh, "Could not start fresh", "无法重新开始"),
+                        Storage::start_fresh,
+                    ),
+                    MessageDialogResult::No => recover(
+                        handle,
+                        tr(zh, "Could not start fresh", "无法重新开始"),
+                        Storage::start_fresh,
+                    ),
+                    MessageDialogResult::Custom(label) if label == open_folder => {
                         let _ = open::that_detached(dir);
+                        handle.exit(1);
                     }
-                    handle.exit(1);
+                    MessageDialogResult::Yes => {
+                        let _ = open::that_detached(dir);
+                        handle.exit(1);
+                    }
+                    _ => handle.exit(1),
                 });
         } else {
             dialog.show(move |_| handle.exit(1));
@@ -350,35 +465,84 @@ fn startup_error(app: &tauri::App, error: desktop_manager::Error) {
     }
     dialog
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "Restore backup".into(),
-            "Close".into(),
+            tr(zh, "Restore backup", "恢复备份").into(),
+            close.into(),
         ))
         .show(move |restore| {
             if !restore {
                 handle.exit(1);
                 return;
             }
-            tauri::async_runtime::spawn_blocking(move || {
-                let result = Manager::default_home()
-                    .and_then(Storage::open)
-                    .and_then(|s| s.restore_backup());
-                match result {
-                    Ok(()) => handle.request_restart(),
-                    Err(error) => {
-                        let app = handle.clone();
-                        handle
-                            .dialog()
-                            .message(format!("Could not restore the backup: {error:#}"))
-                            .show(move |_| app.exit(1));
-                    }
-                }
-            });
+            recover(
+                handle,
+                tr(zh, "Could not restore the backup", "无法恢复备份"),
+                Storage::restore_backup,
+            );
         });
+}
+
+/// The single-instance plugin needs a session bus on Linux. Without one, a
+/// second launch reaches the configuration lock instead; ask the owner of
+/// that lock to show its window over a private socket in the same folder.
+#[cfg(unix)]
+const INSTANCE_SOCKET: &str = "manager.sock";
+#[cfg(unix)]
+fn raise_running_instance() -> bool {
+    use desktop_manager::storage::{Storage, LOCKED};
+    let Ok(home) = Manager::default_home() else {
+        return false;
+    };
+    match Storage::open(home.clone()) {
+        Err(error) if format!("{error:#}").contains(LOCKED) => {
+            std::os::unix::net::UnixStream::connect(home.join(INSTANCE_SOCKET)).is_ok()
+        }
+        _ => false,
+    }
+}
+#[cfg(unix)]
+fn listen_for_second_instance(app: tauri::AppHandle) {
+    let Ok(home) = Manager::default_home() else {
+        return;
+    };
+    // This process holds the configuration lock, so any socket is stale.
+    let path = home.join(INSTANCE_SOCKET);
+    let _ = std::fs::remove_file(&path);
+    if let Ok(listener) = std::os::unix::net::UnixListener::bind(path) {
+        std::thread::spawn(move || {
+            for _ in listener.incoming().flatten() {
+                show(&app);
+            }
+        });
+    }
+}
+
+/// Tauri reports a missing WebView2 Runtime from inside window creation and
+/// then leaves a windowless single-instance process behind. Check first and
+/// exit as soon as the message is dismissed.
+#[cfg(windows)]
+fn require_webview2() {
+    if tauri::webview_version().is_ok() {
+        return;
+    }
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Coding Tools MCP")
+        .set_description(
+            "Could not find the Microsoft Edge WebView2 Runtime.\n\nInstall it from https://developer.microsoft.com/microsoft-edge/webview2 and start Coding Tools MCP again.\n\n找不到 Microsoft Edge WebView2 Runtime。\n\n请从 https://developer.microsoft.com/microsoft-edge/webview2 安装后重新启动 Coding Tools MCP。",
+        )
+        .show();
+    std::process::exit(1);
 }
 
 fn main() {
     if let Some(code) = desktop_manager::supervisor::run_if_requested() {
         std::process::exit(code);
+    }
+    #[cfg(windows)]
+    require_webview2();
+    #[cfg(unix)]
+    if raise_running_instance() {
+        return;
     }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -430,6 +594,8 @@ fn main() {
             };
             let labels = tray_labels(&manager.settings().language);
             app.manage(manager);
+            #[cfg(unix)]
+            listen_for_second_instance(app.handle().clone());
             let show_item =
                 tauri::menu::MenuItem::with_id(app, "show", labels.0, true, None::<&str>)?;
             let quit_item =
@@ -458,8 +624,22 @@ fn main() {
                 let app = window.app_handle();
                 if !app.state::<AtomicBool>().load(Ordering::SeqCst) {
                     api.prevent_close();
-                    if app.state::<AppManager>().settings().close_to_tray {
+                    let manager = app.state::<AppManager>();
+                    let settings = manager.settings();
+                    if settings.close_to_tray {
                         let _ = window.hide();
+                        if manager.claim_tray_hint() {
+                            let zh = settings.language == "zh";
+                            app.dialog()
+                                .message(tr(
+                                    zh,
+                                    "Coding Tools MCP is still running in the system tray, and your services stay available. Use the tray icon to show the window or to stop services and quit. This message is shown only once.",
+                                    "Coding Tools MCP 仍在系统托盘中运行，服务保持可用。可通过托盘图标重新显示窗口，或停止服务并退出。此提示只显示一次。",
+                                ))
+                                .title("Coding Tools MCP")
+                                .kind(MessageDialogKind::Info)
+                                .show(|_| {});
+                        }
                     } else {
                         request_quit(app.clone());
                     }

@@ -110,9 +110,37 @@ fn parse_legacy_command(command: &str, windows: bool) -> Result<Vec<String>> {
 pub const CONFIG_FILE: &str = "desktop-v2.json";
 pub const CONFIG_BACKUP: &str = "desktop-v2.json.bak";
 
+/// Reported when another running manager holds the configuration lock.
+pub const LOCKED: &str = "Another desktop manager is already using this configuration";
+
+/// Older desktop versions stored canonicalized Windows paths in the verbatim
+/// `\\?\` namespace. Use normal Win32 spelling for local drives and UNC
+/// shares; keep the namespace for device paths and long paths.
+pub(crate) fn plain_windows_path(text: &str) -> Option<String> {
+    if text.encode_utf16().count() >= 260 {
+        return None;
+    }
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{unc}"));
+    }
+    let drive = text.strip_prefix(r"\\?\")?;
+    (drive.as_bytes().get(1) == Some(&b':')).then(|| drive.to_owned())
+}
+
 fn decode_config(bytes: &[u8]) -> Result<Config> {
-    let config = serde_json::from_slice(bytes).context("Configuration is not valid JSON")?;
+    let mut config: Config =
+        serde_json::from_slice(bytes).context("Configuration is not valid JSON")?;
     validate_config(&config)?;
+    for workspace in &mut config.workspaces {
+        for text in [&mut workspace.path, &mut workspace.credentials_file]
+            .into_iter()
+            .chain(workspace.core_command.first_mut())
+        {
+            if let Some(plain) = plain_windows_path(text) {
+                *text = plain;
+            }
+        }
+    }
     Ok(config)
 }
 
@@ -134,8 +162,7 @@ impl Storage {
             .read(true)
             .write(true)
             .open(lock_path)?;
-        lock.try_lock_exclusive()
-            .context("Another desktop manager is already using this configuration")?;
+        lock.try_lock_exclusive().context(LOCKED)?;
         Ok(Self { home, _lock: lock })
     }
     pub fn state_dir(&self, id: &str) -> Result<PathBuf> {
@@ -221,6 +248,51 @@ impl Storage {
             Err(error) => return Err(error).context("Could not read the damaged configuration"),
         }
         private_write(&main, &backup)
+    }
+    /// Move unreadable configuration files aside so the next load starts
+    /// empty. Nothing is deleted, and a healthy configuration is never moved.
+    pub fn start_fresh(&self) -> Result<()> {
+        let main = self.home.join(CONFIG_FILE);
+        match fs::read(&main) {
+            Ok(old) if other_config_version(&old) => {
+                bail!("This configuration needs a compatible desktop version; it was not replaced")
+            }
+            Ok(old) if decode_config(&old).is_ok() => {
+                bail!("The main configuration is already valid; it was not replaced")
+            }
+            _ => {}
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        for (file, saved) in [
+            (CONFIG_FILE, format!("desktop-v2.invalid-{id}.json")),
+            (CONFIG_BACKUP, format!("desktop-v2.invalid-{id}.json.bak")),
+        ] {
+            match fs::rename(self.home.join(file), self.home.join(saved)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).context("Could not preserve the damaged configuration")
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    /// Language for dialogs shown before the configuration can be loaded.
+    pub fn preferred_language(home: &Path) -> String {
+        let saved = [CONFIG_FILE, CONFIG_BACKUP].into_iter().find_map(|file| {
+            let value: Value = serde_json::from_slice(&fs::read(home.join(file)).ok()?).ok()?;
+            value["settings"]["language"].as_str().map(str::to_owned)
+        });
+        let system = || {
+            ["LC_ALL", "LC_MESSAGES", "LANG"]
+                .into_iter()
+                .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+                .unwrap_or_default()
+        };
+        if saved.unwrap_or_else(system).starts_with("zh") {
+            "zh".into()
+        } else {
+            "en".into()
+        }
     }
     pub fn load(&self) -> Result<(Config, Option<String>)> {
         let path = self.home.join(CONFIG_FILE);
@@ -369,6 +441,58 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn start_fresh_keeps_both_damaged_files_and_loads_an_empty_config() {
+        let home = tempfile::tempdir().unwrap();
+        let storage = Storage::open(home.path().to_owned()).unwrap();
+        storage.save(&Config::default()).unwrap();
+        assert!(storage.start_fresh().is_err(), "healthy config must stay");
+        std::fs::write(home.path().join(CONFIG_FILE), "{damaged").unwrap();
+        std::fs::write(home.path().join(CONFIG_BACKUP), "{also damaged").unwrap();
+        assert!(storage.load().is_err());
+        storage.start_fresh().unwrap();
+        assert!(storage.load().unwrap().0.workspaces.is_empty());
+        let mut kept: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .flatten()
+            .filter(|v| v.file_name().to_string_lossy().contains(".invalid-"))
+            .map(|v| std::fs::read_to_string(v.path()).unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["{also damaged", "{damaged"]);
+    }
+    #[test]
+    fn legacy_verbatim_windows_paths_are_normalized_on_load() {
+        let home = tempfile::tempdir().unwrap();
+        let storage = Storage::open(home.path().to_owned()).unwrap();
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value["workspaces"] = serde_json::json!([
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "a", "path": r"\\?\C:\Users\me\project"},
+            {"id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "name": "b", "path": r"\\?\UNC\server\share\project"},
+            {"id": "cccccccccccccccccccccccccccccccc", "name": "c", "path": r"\\?\Volume{1}\project"},
+        ]);
+        std::fs::write(
+            home.path().join(CONFIG_FILE),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let paths: Vec<_> = storage
+            .load()
+            .unwrap()
+            .0
+            .workspaces
+            .into_iter()
+            .map(|w| w.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                r"C:\Users\me\project",
+                r"\\server\share\project",
+                r"\\?\Volume{1}\project"
+            ]
+        );
+    }
     #[test]
     fn last_good_backup_can_be_restored_without_overwriting_the_damaged_bytes() {
         let home = tempfile::tempdir().unwrap();
